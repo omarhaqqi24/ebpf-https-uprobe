@@ -1,4 +1,3 @@
 #!/bin/bash
 
-go generate
-go build -o ssl-sniffer .
+go generate && go build -o ssl-sniffer .
