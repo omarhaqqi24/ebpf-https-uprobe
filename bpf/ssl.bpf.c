@@ -448,15 +448,26 @@ static __always_inline int update_request_verdict(struct parser_ctx *ctx,
         .tracking_status = tracking,
         .flags = ctx->state->request_flags,
     };
+    /*
+     * Keep the exact sequence entry for diagnostics, plus a per-connection
+     * latest slot for Nginx enforcement. Nginx and this parser have separate
+     * counters; the parser counter restarts when the detector restarts, while
+     * Nginx's keep-alive counter does not. Sequence zero is reserved for the
+     * latest slot and is never assigned to a real HTTP request.
+     */
     int rc = bpf_map_update_elem(&request_verdicts, &key, &value, BPF_ANY);
+    struct verdict_key latest_key = key;
+    latest_key.request_sequence = 0;
+    int latest_rc = bpf_map_update_elem(&request_verdicts, &latest_key,
+                                        &value, BPF_ANY);
     struct request_counters *counters = get_request_counters();
     if (counters) {
-        if (rc == 0)
+        if (rc == 0 && latest_rc == 0)
             counters->verdict_updates++;
         else
             counters->verdict_update_failures++;
     }
-    return rc;
+    return rc != 0 ? rc : latest_rc;
 }
 
 static __always_inline void reset_request(struct conn_state *state)

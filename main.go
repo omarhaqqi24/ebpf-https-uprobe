@@ -124,6 +124,29 @@ type RequestVerdictValue struct {
 
 const verdictStatusMalicious uint32 = 2
 
+// clearLatestVerdicts removes sequence-zero enforcement slots at startup.
+// Exact sequence entries are retained for diagnostics and expire normally.
+func clearLatestVerdicts(m *ebpf.Map) (int, error) {
+	it := m.Iterate()
+	var key RequestVerdictKey
+	var value RequestVerdictValue
+	var latest []RequestVerdictKey
+	for it.Next(&key, &value) {
+		if key.RequestSequence == 0 {
+			latest = append(latest, key)
+		}
+	}
+	if err := it.Err(); err != nil {
+		return 0, fmt.Errorf("iterate request-verdict map: %w", err)
+	}
+	for _, key := range latest {
+		if err := m.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return 0, fmt.Errorf("delete stale latest verdict: %w", err)
+		}
+	}
+	return len(latest), nil
+}
+
 func securePinnedMap(path, group string) error {
 	g, err := user.LookupGroup(group)
 	if err != nil {
@@ -398,6 +421,11 @@ func main() {
 			log.Printf("pinned request-verdict map path=%s nginx_group=%s", *verdictMapPath, *nginxGroup)
 		}
 	}
+	clearedLatest, err := clearLatestVerdicts(objs.RequestVerdicts)
+	if err != nil {
+		log.Fatalf("clearing stale latest request verdicts: %v", err)
+	}
+	log.Printf("cleared stale latest request verdicts count=%d", clearedLatest)
 	if *unpinOnExit {
 		defer func() {
 			pinned, err := ebpf.LoadPinnedMap(*verdictMapPath, nil)

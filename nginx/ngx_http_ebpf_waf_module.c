@@ -90,12 +90,15 @@ static char *ngx_http_ebpf_waf_merge_loc_conf(ngx_conf_t *cf, void *parent,
     void *child);
 static ngx_int_t ngx_http_ebpf_waf_init_process(ngx_cycle_t *cycle);
 static void ngx_http_ebpf_waf_exit_process(ngx_cycle_t *cycle);
+static ngx_int_t ngx_http_ebpf_waf_open_map(ngx_log_t *log);
 static char *ngx_http_ebpf_waf_set_block_signatures(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_ebpf_waf_handler(ngx_http_request_t *r);
 static void ngx_http_ebpf_waf_body_ready(ngx_http_request_t *r);
 
 static int ngx_http_ebpf_waf_verdict_fd = -1;
+static u_char *ngx_http_ebpf_waf_verdict_path = NULL;
+static ngx_msec_t ngx_http_ebpf_waf_next_map_retry = 0;
 
 static ngx_conf_enum_t ngx_http_ebpf_waf_modes[] = {
     { ngx_string("observe"), EBPF_WAF_OBSERVE },
@@ -206,6 +209,37 @@ ngx_http_ebpf_waf_obj_get(const char *path)
 }
 
 static ngx_int_t
+ngx_http_ebpf_waf_open_map(ngx_log_t *log)
+{
+    if (ngx_http_ebpf_waf_verdict_fd >= 0) {
+        return NGX_OK;
+    }
+
+    if (ngx_http_ebpf_waf_verdict_path == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_current_msec < ngx_http_ebpf_waf_next_map_retry) {
+        return NGX_ERROR;
+    }
+    ngx_http_ebpf_waf_next_map_retry = ngx_current_msec + 1000;
+
+    ngx_http_ebpf_waf_verdict_fd = ngx_http_ebpf_waf_obj_get(
+        (char *) ngx_http_ebpf_waf_verdict_path);
+    if (ngx_http_ebpf_waf_verdict_fd < 0) {
+        ngx_log_error(NGX_LOG_WARN, log, ngx_errno,
+            "ebpf_waf: cannot open verdict map \"%s\"; will retry",
+            ngx_http_ebpf_waf_verdict_path);
+        return NGX_ERROR;
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, log, 0,
+        "ebpf_waf: opened shared verdict map \"%s\"",
+        ngx_http_ebpf_waf_verdict_path);
+    return NGX_OK;
+}
+
+static ngx_int_t
 ngx_http_ebpf_waf_lookup(const ebpf_waf_verdict_key_t *key,
     ebpf_waf_verdict_value_t *value)
 {
@@ -272,16 +306,18 @@ ngx_http_ebpf_waf_decide(ngx_http_request_t *r,
     ngx_http_ebpf_waf_loc_conf_t *lcf, ngx_http_ebpf_waf_ctx_t *ctx)
 {
     ebpf_waf_verdict_value_t value;
+    ebpf_waf_verdict_key_t latest_key = ctx->key;
     ngx_int_t rc;
     ngx_uint_t reject;
     const char *reason;
 
-    if (ngx_http_ebpf_waf_verdict_fd < 0) {
+    if (ngx_http_ebpf_waf_open_map(r->connection->log) != NGX_OK) {
         return ngx_http_ebpf_waf_unavailable(r, lcf, "map_unavailable");
     }
 
     ngx_memzero(&value, sizeof(value));
-    rc = ngx_http_ebpf_waf_lookup(&ctx->key, &value);
+    latest_key.request_sequence = 0;
+    rc = ngx_http_ebpf_waf_lookup(&latest_key, &value);
     if (rc != NGX_OK) {
         ngx_log_error(NGX_LOG_NOTICE, r->connection->log, ngx_errno,
             "ebpf_waf: map_lookup=miss pid=%P ssl=%p seq=%ui",
@@ -291,7 +327,7 @@ ngx_http_ebpf_waf_decide(ngx_http_request_t *r,
     }
 
     if (ngx_http_ebpf_waf_expired(&value)) {
-        (void) ngx_http_ebpf_waf_delete(&ctx->key);
+        (void) ngx_http_ebpf_waf_delete(&latest_key);
         return ngx_http_ebpf_waf_unavailable(r, lcf, "verdict_expired");
     }
 
@@ -304,14 +340,14 @@ ngx_http_ebpf_waf_decide(ngx_http_request_t *r,
         (value.status == EBPF_WAF_VERDICT_MALICIOUS &&
          value.inspection_status != EBPF_WAF_INSPECTION_STOPPED_AFTER_MATCH))
     {
-        (void) ngx_http_ebpf_waf_delete(&ctx->key);
+        (void) ngx_http_ebpf_waf_delete(&latest_key);
         return ngx_http_ebpf_waf_unavailable(r, lcf, "verdict_incomplete_or_uncorrelated");
     }
 
     reject = value.status == EBPF_WAF_VERDICT_MALICIOUS &&
         ngx_http_ebpf_waf_blocking_signature(lcf->blocking_signatures,
                                              value.first_signature);
-    (void) ngx_http_ebpf_waf_delete(&ctx->key);
+    (void) ngx_http_ebpf_waf_delete(&latest_key);
 
     if (lcf->mode == EBPF_WAF_OBSERVE) {
         ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
@@ -514,16 +550,12 @@ ngx_http_ebpf_waf_init_process(ngx_cycle_t *cycle)
     }
     ngx_memcpy(path, mcf->verdict_map.data, mcf->verdict_map.len);
     path[mcf->verdict_map.len] = '\0';
+    ngx_http_ebpf_waf_verdict_path = path;
+    ngx_http_ebpf_waf_next_map_retry = 0;
 
-    ngx_http_ebpf_waf_verdict_fd = ngx_http_ebpf_waf_obj_get((char *) path);
-    if (ngx_http_ebpf_waf_verdict_fd < 0) {
-        ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
-            "ebpf_waf: cannot open verdict map \"%s\"; configured fallback will apply", path);
-        return NGX_OK;
-    }
-
-    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-        "ebpf_waf: opened shared verdict map \"%s\"", path);
+    /* A detector may start after Nginx. Keep the configured path and retry
+     * lazily from request handling until the pinned map becomes available. */
+    (void) ngx_http_ebpf_waf_open_map(cycle->log);
     return NGX_OK;
 }
 
@@ -534,4 +566,6 @@ ngx_http_ebpf_waf_exit_process(ngx_cycle_t *cycle)
         (void) close(ngx_http_ebpf_waf_verdict_fd);
         ngx_http_ebpf_waf_verdict_fd = -1;
     }
+    ngx_http_ebpf_waf_verdict_path = NULL;
+    ngx_http_ebpf_waf_next_map_retry = 0;
 }

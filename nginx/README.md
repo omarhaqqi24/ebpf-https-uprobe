@@ -6,18 +6,16 @@ ABI. It reads and consumes metadata-only verdicts from the pinned
 
 ## Correlation model
 
-The module constructs the same key as eBPF:
-
-`(getpid(), r->connection->ssl->connection, r->connection->requests)`
-
-The 1.24 headers expose the TLS `SSL*` as
-`ngx_connection_t.ssl->connection`. Nginx increments the client connection's
-`requests` counter in `ngx_http_create_request()` for each main HTTP request;
-internal redirects and subrequests do not allocate another main request. The
-eBPF side assigns its sequence at the first method byte. This is intended to
-align for valid HTTP/1.1 requests on the same worker and SSL object. It must be
-kept under regression testing; a missing, expired, incomplete, unsupported, or
-uncorrelated verdict follows the configured fallback.
+The module uses the TLS connection identity `(getpid(), SSL*)` to read a
+sequence-zero latest-verdict slot. eBPF also keeps sequence-keyed entries for
+diagnostics, but enforcement does not depend on its request sequence matching
+Nginx's counter. The two counters can diverge after a detector restart on an
+existing keep-alive connection because Nginx retains its counter while the BPF
+parser state is recreated. The latest slot is replaced as each request is
+parsed and consumed by Nginx once. At detector startup, stale sequence-zero
+slots are cleared so verdicts from before the restart cannot affect new
+requests. A missing, expired, incomplete, unsupported, or uncorrelated verdict
+follows the configured fallback.
 
 The module only correlates TLS HTTP/1.1 requests that are not chunked. Nginx
 currently has the HTTP/2 module compiled in but the OJS vhosts do not enable
@@ -51,9 +49,10 @@ make modules
 Use Bash for the `conf_flags` array. The resulting object is
 `objs/ngx_http_ebpf_waf_module.so`. Copy it to a versioned module directory and
 test a separate configuration with the installed `nginx -t -p <test-prefix> -c
-<test-config>` before adding `load_module` to the live configuration. Do not
-reload the service until the isolated tests pass and the configuration has
-been reviewed.
+<test-config>` before adding `load_module` to the live configuration. After
+replacing an already-loaded module, run `nginx -t` and restart the Nginx service
+to make the master load the new shared object; a graceful reload can retain the
+old module mapping in the existing master process.
 
 ## Configuration
 
@@ -95,15 +94,15 @@ By default it pins at
 `/sys/fs/bpf/ebpf-https-uprobe/request_verdicts`, sets the map file to
 `root:www-data` mode `0660`, and makes the dedicated parent directory
 traversable by that group. The detector owns map creation and expiration
-cleanup; Nginx opens the map once per worker and consumes entries once. The
-detector must start before Nginx workers if reject mode is to have a map. If
-Nginx starts first, its configured fallback applies until workers restart and
-open the map. The bpffs mount root itself must also allow the worker to
-traverse `/sys/fs/bpf`; on this host it was `root:root 0700`, so traversal had
-to be enabled before the worker could open the dedicated map directory. Keep
-the dedicated map directory and map file restricted to the Nginx worker group.
+cleanup. Workers open the pinned map at startup and retry once per second on
+requests if it was unavailable, so the detector can start after Nginx. The
+bpffs mount root must also allow the worker to traverse `/sys/fs/bpf`; this
+host uses `root:www-data 0710`, restored after boot by
+`/etc/tmpfiles.d/ebpf-waf-bpffs.conf`. Keep the dedicated map directory and map
+file restricted to the Nginx worker group.
 
-The map key is 24 bytes: `u32 tgid`, `u32 pad`, `u64 ssl`, `u64 sequence`. The
+The map key is 24 bytes: `u32 tgid`, `u32 pad`, `u64 ssl`, `u64 sequence`;
+sequence zero is reserved for the per-connection latest-verdict slot. The
 value is 40 bytes: `u32 status`, `u32 first_signature`, `u64 updated_ns`,
 `u64 expires_ns`, then four `u32` fields for correlation, inspection, tracking,
 and diagnostic flags. Entries expire after five minutes and are also deleted
@@ -130,6 +129,10 @@ reload the system service configuration. Results:
 - On one TLS keep-alive connection, requests 1 and 2 were allowed, malicious
   request 3 was rejected, and benign request 4 was allowed. Nginx and eBPF
   logged matching TGID, SSL pointer, and request sequences 1 through 4.
+- After restarting only the detector on an existing TLS keep-alive connection,
+  Nginx request sequence 3 was rejected even though the restarted BPF parser
+  assigned that request sequence 1. This verifies the sequence-independent
+  latest-verdict slot across detector restarts.
 - In observe mode, the PoC returned 204, reached upstream, and logged
   `would_reject=1`.
 - A small XML body containing only `<file_name>` was allowed.
