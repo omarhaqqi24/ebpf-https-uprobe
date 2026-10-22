@@ -64,4 +64,4 @@ Thumbs.db
 *.bak
 
 # Local AI-agent artifacts (only if not part of project documentation)
-# /agent/
+/agent/
