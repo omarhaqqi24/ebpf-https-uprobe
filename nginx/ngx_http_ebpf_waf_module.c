@@ -338,7 +338,8 @@ ngx_http_ebpf_waf_decide(ngx_http_request_t *r,
         (value.status == EBPF_WAF_VERDICT_CLEAN &&
          value.inspection_status != EBPF_WAF_INSPECTION_COMPLETE) ||
         (value.status == EBPF_WAF_VERDICT_MALICIOUS &&
-         value.inspection_status != EBPF_WAF_INSPECTION_STOPPED_AFTER_MATCH))
+         value.inspection_status != EBPF_WAF_INSPECTION_STOPPED_AFTER_MATCH &&
+         value.inspection_status != EBPF_WAF_INSPECTION_COMPLETE))
     {
         (void) ngx_http_ebpf_waf_delete(&latest_key);
         return ngx_http_ebpf_waf_unavailable(r, lcf, "verdict_incomplete_or_uncorrelated");

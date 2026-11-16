@@ -1,69 +1,93 @@
 # eBPF HTTPS WAF pre-filter
 
-The `SSL_read()` uretprobe copies decrypted plaintext into a per-CPU 4096-byte
-scratch buffer and feeds it to both a streaming signature scanner and a minimal
-HTTP/1.1 request tracker. Request bodies are never sent to userspace or written
-to `dataset.jsonl`.
+The SSL_read uretprobe reads decrypted plaintext into a per-CPU scratch buffer.
+eBPF performs signature matching, rule evaluation, and verdict updates. A
+separate raw-event ring buffer copies each available plaintext chunk to Go for
+HTTP logging; file I/O and HTTP parsing stay in user space and do not affect
+kernel verdicts.
+
+## Rules
+
+Put one YAML file per rule in rules/. The loader validates all files in sorted
+filename order before populating the BPF maps. Patterns are ASCII literals,
+limited to 24 bytes. Each rule may contain up to 32 signatures, with at most
+32 rules and 32 total runtime signatures. The loader compiles enabled literal
+signatures into separate case-sensitive and ASCII-folded Aho-Corasick
+transition tables. Each automaton is limited to 512 states. Only the `any`
+operator is supported; `all` rules are rejected during rule loading because
+kernel verdict evaluation must remain bounded and verifier-safe.
+
+The bundled OJS-FILE-001.yaml and OJS-TRAVERSAL-001.yaml contain the existing
+PHP/upload and path-traversal literals. Disabled rules are validated but are
+not evaluated. For case-insensitive patterns, matching uses ASCII lowercasing
+only.
 
 ## Detection and request identity
 
-The scanner maintains a 24-byte rolling window across chunks and reads. The
-first configured signature in a reliably tracked request immediately marks the
-request malicious, records that signature, and emits a metadata-only detection
-event. It then skips further signature comparisons for that request while the
-tracker continues through the framing boundary. A single signature is
-sufficient; composite rule bits are not used as a verdict.
+The eBPF scanner advances two automaton states per byte using precompiled map
+transitions, one for exact patterns and one for ASCII case-insensitive patterns.
+Each transition carries the matching signature bits, rule bits, and legacy
+verdict category bits, so the kernel callback does not scan a rule list or
+compare each pattern byte. Matcher state is cleared at each request boundary.
+A matching enabled rule immediately writes a malicious verdict; scanning
+continues to the HTTP boundary to collect further matches.
 
-Request sequences are assigned at the first method byte. Completed request
-events carry `(TGID, SSL pointer, sequence)`, request metadata, verdict, and
-inspection/tracking statuses. Immediate detection events are terminal logs and
-do not become extra dataset rows. Only completed request events are appended to
-`dataset.jsonl`; metadata truncation and oversize threshold flags remain
-visible in those rows.
+The Nginx verdict map key/value layout is unchanged. The first_signature
+field retains the existing category bits used by the Nginx policy; detailed
+runtime signature and rule bitsets are carried in request events and translated
+back to YAML IDs by Go. Adding a new rule does not automatically add its
+signature category to the Nginx rejection policy.
 
-## Framing and limits
+## HTTP logging
 
-The tracker handles HTTP/1.1 request lines, header termination, and a single
-valid `Content-Length`. It does not implement chunked transfer encoding. On
-malformed or unsupported framing it marks correlation unknown and disables
-tracking for that SSL object; the scanner keeps inspecting subsequent plaintext
-and reports the first match in each `SSL_read()` result as unattributed. It
-restarts matching on the next result so later traffic remains scannable. It does
-not guess request boundaries or invent a sequence after tracking is lost.
+Go reassembles raw_events by (TGID, SSL pointer, read_sequence, chunk_index)
+and parses HTTP/1.1 requests framed by Content-Length. It preserves header
+order and duplicates and supports multiple requests per read. Kernel request
+events and parsed requests are joined only by (TGID, SSL pointer,
+request_sequence). A gap, truncation, unsupported framing, or unknown
+correlation is reported as incomplete/unsupported; the parser does not infer
+request boundaries from timestamps or URIs.
 
-Long header values and request metadata do not disable scanning. Method and URI
-metadata are bounded to their event fields and explicitly flagged when
-truncated. Requests above the 8192-byte reporting threshold continue to be
-tracked and scanned without retaining their body.
+The logger creates logs/requests.jsonl and logs/malicious.log at startup.
+Requests contain parsed method, URI, version, ordered headers, and a body when
+present. Valid UTF-8 bodies are logged as text; other bodies are Base64.
+Sensitive headers and common password/token/secret/API-key fields in JSON or
+form bodies are redacted in a logging copy. Generic body redaction can miss
+application-specific secrets or redact harmless fields. Detection always uses
+the original plaintext.
 
-Each positive `SSL_read()` result is processed in up to four bounded 4096-byte
-chunks (16 KiB total per call). The code never reads past either the returned
-plaintext length or the destination-buffer capacity supplied to `SSL_read()`.
-If a result exceeds that per-call work limit, or a safe user-memory read fails,
-the available prefix is scanned and a capture-incomplete diagnostic is emitted;
-the unprocessed suffix is not claimed as inspected. Scanner matches can span
-chunk boundaries.
+malicious.log has one text line per correlated malicious request. If events
+cannot be correlated, the detection is retained with unknown sequence and
+request metadata may be unavailable. Files are buffered, created with 0600
+permissions in a 0700 directory, and rotated at about 64 MiB with five backups.
 
-Ring-buffer event loss is counted separately for request and detection events.
-`SSL_free()` removes per-connection state. This detector only logs and records
-matches in kernel space. The optional Nginx module described below consumes
-per-request verdicts and applies HTTP-level rejection; the detector does not
-drop encrypted packets.
+The raw ring buffer uses a fixed 4096-byte payload per event and a 16 MiB
+capacity. Raw-event drops are counted separately and never block or change
+eBPF inspection/enforcement. A lost chunk makes Go correlation unknown. Each
+SSL_read is processed by eBPF in up to four 4096-byte chunks (16 KiB);
+larger results and user-memory read failures are marked capture-incomplete.
+The parser supports HTTP/1.1 with a single valid Content-Length; chunked
+transfer encoding, HTTP/2, and malformed framing remain unsupported.
+Go caps an individual buffered stream/request at 16 MiB; larger bodies are
+logged as incomplete rather than buffered without limit. When the host enforces
+RLIMIT_MEMLOCK, launch with a limit large enough for the BPF maps, including the
+16 MiB raw ring buffer.
+
+Run with ./ssl-sniffer -rules ./rules. Set EBPF_WAF_RULES_DIR to choose a
+different rule directory.
 
 ## Request-level enforcement prototype
 
-The detector writes verdicts synchronously to a pinned BPF hash map keyed by
-`(TGID, SSL pointer, request sequence)`. The standalone module in `nginx/`
-reads and consumes those metadata-only verdicts in the Nginx access phase after
-the request body has been buffered. `observe` is the default; `reject` returns
-HTTP 403 only for reliable, complete `TRAVERSAL_RAW` or
-`TRAVERSAL_XML_ENTITY` verdicts selected by policy. `FILE_NAME_TAG` is not a
-blocking signature.
+The standalone module in nginx/ reads verdicts from the pinned map and can
+apply HTTP-level rejection after the request body has been buffered. observe
+is the default; reject returns HTTP 403 only for reliable, complete
+TRAVERSAL_RAW or TRAVERSAL_XML_ENTITY verdicts selected by policy.
+FILE_NAME_TAG is not a blocking signature.
 
 This prototype correlates TLS HTTP/1.1 requests using Nginx's per-connection
-request count and the same `SSL*` exposed by its public headers. Chunked
+request count and the same SSL* exposed by its public headers. Chunked
 requests, HTTP/2, and incomplete or uncertain tracking follow the configured
 fallback. Keep HTTP/2 disabled on protected routes until the eBPF parser
-supports it. See [`nginx/README.md`](nginx/README.md) for build, permissions,
-configuration, and validation details. The live OJS Nginx configuration has
-not been changed or reloaded.
+supports it. See nginx/README.md for build, permissions, configuration, and
+validation details. The live OJS Nginx configuration has not been changed or
+reloaded.

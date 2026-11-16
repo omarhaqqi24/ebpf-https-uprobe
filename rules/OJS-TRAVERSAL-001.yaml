@@ -1,0 +1,41 @@
+id: OJS-TRAVERSAL-001
+name: Path traversal encodings
+vulnerability: path_traversal
+description: Detects raw and entity-encoded parent path patterns.
+enabled: true
+severity: high
+match:
+  operator: any
+signatures:
+  - id: TRAVERSAL-RAW
+    pattern: "../"
+    case_sensitive: true
+  - id: TRAVERSAL-BACKSLASH
+    pattern: "..\\"
+    case_sensitive: true
+  - id: TRAVERSAL-XML-DECIMAL-RAW-SLASH
+    pattern: "&#46;&#46;/"
+    case_sensitive: true
+  - id: TRAVERSAL-XML-DECIMAL-ENCODED-SLASH
+    pattern: "&#46;&#46;&#47;"
+    case_sensitive: true
+  - id: TRAVERSAL-XML-HEX-RAW-SLASH
+    pattern: "&#x2e;&#x2e;/"
+    case_sensitive: true
+  - id: TRAVERSAL-XML-HEX-ENCODED-SLASH
+    pattern: "&#x2e;&#x2e;&#x2f;"
+    case_sensitive: true
+  - id: TRAVERSAL-RAW-DOT-DECIMAL-SLASH
+    pattern: "..&#47;"
+    case_sensitive: true
+  - id: TRAVERSAL-RAW-DOT-HEX-SLASH
+    pattern: "..&#x2f;"
+    case_sensitive: true
+  - id: TRAVERSAL-NAMED-ENTITIES
+    pattern: "&dot;&dot;&slash;"
+    case_sensitive: true
+  - id: TRAVERSAL-UPPER-HEX
+    pattern: "&#x2E;&#x2E;&#x2F;"
+    case_sensitive: true
+
+

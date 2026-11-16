@@ -1,0 +1,23 @@
+id: OJS-FILE-001
+name: Embedded PHP file content
+vulnerability: file_upload
+description: >-
+  Detects PHP file content and embedded base64 upload metadata in request data.
+enabled: true
+severity: high
+match:
+  operator: any
+signatures:
+  - id: TEXT-X-PHP
+    pattern: "text/x-php"
+    case_sensitive: true
+  - id: EMBED-TAG
+    pattern: "<embed"
+    case_sensitive: true
+  - id: BASE64-ATTR-DOUBLE-QUOTED
+    pattern: 'encoding="base64"'
+    case_sensitive: true
+  - id: BASE64-ATTR-SINGLE-QUOTED
+    pattern: "encoding='base64'"
+    case_sensitive: true
+

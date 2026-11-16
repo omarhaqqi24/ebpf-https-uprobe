@@ -52,19 +52,33 @@ enum verdict_status {
     VERDICT_INCOMPLETE = 3,
 };
 
-/* Signature bits: these describe raw byte patterns observed in the supplied PoCs. */
-#define SIG_TEXT_X_PHP          (1U << 0)
-#define SIG_EMBED_TAG           (1U << 1)
-#define SIG_BASE64_ATTR_DQ      (1U << 2)
-#define SIG_BASE64_ATTR_SQ      (1U << 3)
-#define SIG_FILE_NAME_TAG       (1U << 4)
-#define SIG_TRAVERSAL_RAW       (1U << 5)
-#define SIG_TRAVERSAL_ENTITY    (1U << 6)
+#define MAX_SIGNATURES 32
+#define MAX_AUTOMATON_STATES 512
+#define MAX_RULES 32
+#define RULE_OPERATOR_ANY 0
+#define RULE_OPERATOR_ALL 1
 
-/* Rule bits. */
-#define RULE_OJS_FILE_CONTEXT   (1U << 0)
-#define RULE_OJS_TRAVERSAL      (1U << 1)
-#define RULE_OJS_CVE_COMBO      (1U << 2)
+struct signature_pattern {
+    __u32 rule_index;
+    __u32 verdict_mask;
+    __u8 enabled;
+    __u8 case_sensitive;
+    __u8 pattern_len;
+    __u8 pad;
+    char pattern[MAX_SIG_LEN];
+};
+struct automaton_transition {
+    __u32 next_state;
+    __u32 matched_signatures;
+    __u32 matched_rules;
+    __u32 verdict_flags;
+};
+struct rule_config {
+    __u32 signature_mask;
+    __u8 enabled;
+    __u8 operator;
+    __u16 pad;
+};
 
 struct ssl_args {
     __u64 ssl;
@@ -108,6 +122,7 @@ struct request_event {
     __u32 matched_rules;
     __u32 is_malicious;
     __u32 first_signature;
+    __u32 matched_signatures;
     __u32 correlation_status;
     __u32 inspection_status;
     __u32 tracking_status;
@@ -115,6 +130,7 @@ struct request_event {
     char uri[MAX_URI_LEN];
     char http_version[MAX_VERSION_LEN];
     __u32 pad_end;
+    __u32 pad_end2;
 };
 
 struct request_counters {
@@ -128,6 +144,11 @@ struct request_counters {
     __u64 unattributed_detections;
     __u64 verdict_updates;
     __u64 verdict_update_failures;
+    __u64 raw_chunks_submitted;
+    __u64 raw_ringbuf_drops;
+    __u64 raw_bytes_submitted;
+    __u64 raw_capture_truncated;
+    __u64 raw_capture_failures;
 };
 
 struct verdict_key {
@@ -161,6 +182,7 @@ struct conn_key {
 
 struct conn_state {
     __u64 last_seen_ns;
+    __u64 read_sequence;
     /* Incremental HTTP/1.1 parser state, scoped to this SSL object. */
     __u64 request_sequence;
     __u64 active_request_sequence;
@@ -188,7 +210,12 @@ struct conn_state {
     __u16 reported_flags;
     __u16 pad_lengths;
     __u32 first_signature;
+    __u32 matched_signatures;
+    __u32 matched_rules;
+    __u32 rule_seen[MAX_RULES];
     __u32 request_scan_window_len;
+    __u32 exact_matcher_state;
+    __u32 folded_matcher_state;
     char request_scan_window[MAX_SIG_LEN];
     char header_name[MAX_HEADER_NAME];
     char method[MAX_METHOD_LEN];
@@ -212,6 +239,48 @@ struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1024 * 1024);
 } request_events SEC(".maps");
+
+struct raw_chunk_event {
+    __u32 tgid;
+    __u32 tid;
+    __u64 ssl;
+    __u64 read_sequence;
+    __u64 timestamp_ns;
+    __u32 read_total_len;
+    __u32 read_offset;
+    __u32 chunk_index;
+    __u32 expected_chunk_count;
+    __u32 data_len;
+    __u32 flags;
+    __u32 event_type; /* 0=chunk, 1=SSL_free */
+    char data[MAX_DATA_SIZE];
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 16 * 1024 * 1024);
+} raw_events SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_SIGNATURES);
+    __type(key, __u32);
+    __type(value, struct signature_pattern);
+} signature_patterns SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 262144);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, __u32);
+    __type(value, struct automaton_transition);
+} automaton_transitions SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_RULES);
+    __type(key, __u32);
+    __type(value, struct rule_config);
+} rule_configs SEC(".maps");
 
 /* Shared with the Nginx module; values contain verdict metadata only. */
 struct {
@@ -263,7 +332,6 @@ static __always_inline int line_equals(const char *line, __u32 len,
 {
     if (len != literal_len)
         return 0;
-#pragma unroll
     for (int i = 0; i < 24; i++) {
         if ((__u32)i >= literal_len)
             break;
@@ -295,24 +363,8 @@ static __always_inline int update_request_verdict(struct parser_ctx *ctx,
                                                    __u32 inspection,
                                                    __u32 tracking);
 
-#define REQUEST_SUFFIX_MATCH(literal) \
-({ \
-    int matched = 0; \
-    const __u32 plen = sizeof(literal) - 1; \
-    if (state->request_scan_window_len >= plen) { \
-        matched = 1; \
-        _Pragma("unroll") \
-        for (int j = 0; j < sizeof(literal) - 1; j++) { \
-            if (state->request_scan_window[MAX_SIG_LEN - plen + j] != (literal)[j]) { \
-                matched = 0; \
-                break; \
-            } \
-        } \
-    } \
-    matched; \
-})
-
 static __always_inline void emit_detection(struct parser_ctx *ctx, __u32 sig,
+                                           __u32 rule_mask, __u32 malicious,
                                            __u32 correlated)
 {
     struct ssl_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
@@ -322,7 +374,6 @@ static __always_inline void emit_detection(struct parser_ctx *ctx, __u32 sig,
             counters->detection_drops++;
         return;
     }
-    __builtin_memset(event, 0, sizeof(*event));
     event->pid = ctx->tgid;
     event->tid = (__u32)bpf_get_current_pid_tgid();
     event->timestamp_ns = ctx->timestamp_ns;
@@ -331,10 +382,11 @@ static __always_inline void emit_detection(struct parser_ctx *ctx, __u32 sig,
     event->ret_len = ctx->ret_len;
     event->scanned_len = ctx->read_len;
     event->signature_flags = sig;
-    event->request_sequence = correlated ? ctx->state->active_request_sequence : 0;
+    event->matched_rules = rule_mask;
+    event->request_sequence = (correlated || (ctx->state->parser_mode != PARSER_DISABLED && ctx->state->request_started)) ? ctx->state->active_request_sequence : 0;
     event->first_signature = sig;
     event->correlation_status = correlated ? CORRELATION_RELIABLE : CORRELATION_UNKNOWN;
-    event->is_malicious = 1;
+    event->is_malicious = malicious;
     event->flags = ctx->state->request_flags;
     event->read_offset = ctx->read_offset;
     bpf_ringbuf_submit(event, 0);
@@ -348,70 +400,50 @@ static __always_inline void emit_detection(struct parser_ctx *ctx, __u32 sig,
 static __always_inline void inspect_request_byte(struct parser_ctx *ctx, char c)
 {
     struct conn_state *state = ctx->state;
-    __u32 signature = 0;
+    __u32 key = state->exact_matcher_state * 256 + (__u8)c;
+    struct automaton_transition *exact = bpf_map_lookup_elem(&automaton_transitions, &key);
+    __u32 exact_next = 0, exact_sigs = 0, exact_rules = 0, exact_flags = 0;
+    if (exact) {
+        exact_next = exact->next_state;
+        exact_sigs = exact->matched_signatures;
+        exact_rules = exact->matched_rules;
+        exact_flags = exact->verdict_flags;
+    }
+    state->exact_matcher_state = exact_next;
 
-    if (state->parser_mode != PARSER_DISABLED && state->inspection_done)
+    __u32 folded_key = (MAX_AUTOMATON_STATES + state->folded_matcher_state) * 256 +
+                       (__u8)lower_ascii(c);
+    struct automaton_transition *folded = bpf_map_lookup_elem(&automaton_transitions, &folded_key);
+    __u32 folded_next = 0, folded_sigs = 0, folded_rules = 0, folded_flags = 0;
+    if (folded) {
+        folded_next = folded->next_state;
+        folded_sigs = folded->matched_signatures;
+        folded_rules = folded->matched_rules;
+        folded_flags = folded->verdict_flags;
+    }
+    state->folded_matcher_state = folded_next;
+
+    __u32 matches = exact_sigs | folded_sigs;
+    if (!matches)
         return;
-    /* Without a trustworthy boundary, report at most one unattributed match
-     * per SSL_read() result. The next result starts scanning again. */
-    if ((state->parser_mode == PARSER_DISABLED || !state->request_started) &&
-        ctx->degraded_match_done)
-        return;
-
-#pragma unroll
-    for (int i = 0; i < MAX_SIG_LEN - 1; i++)
-        state->request_scan_window[i] = state->request_scan_window[i + 1];
-    state->request_scan_window[MAX_SIG_LEN - 1] = c;
-    if (state->request_scan_window_len < MAX_SIG_LEN)
-        state->request_scan_window_len++;
-
-    static const char sig_php[] = "text/x-php";
-    static const char sig_embed[] = "<embed";
-    static const char sig_base64_dq[] = "encoding=\"base64\"";
-    static const char sig_base64_sq[] = "encoding='base64'";
-    // static const char sig_file_name[] = "<file_name>";
-    static const char sig_trav_raw[] = "../";
-    static const char sig_trav_backslash[] = "..\\";
-    static const char sig_trav_dec_dot_raw_slash[] = "&#46;&#46;/";
-    static const char sig_trav_dec_dot_entity_slash[] = "&#46;&#46;&#47;";
-    static const char sig_trav_hex_dot_raw_slash[] = "&#x2e;&#x2e;/";
-    static const char sig_trav_hex_dot_entity_slash[] = "&#x2e;&#x2e;&#x2f;";
-    static const char sig_trav_raw_dot_dec_slash[] = "..&#47;";
-    static const char sig_trav_raw_dot_hex_slash[] = "..&#x2f;";
-    static const char sig_trav_named_entities[] = "&dot;&dot;&slash;";
-    static const char sig_trav_upper_hex[] = "&#x2E;&#x2E;&#x2F;";
-
-    if (!signature && c == 'p' && REQUEST_SUFFIX_MATCH(sig_php)) signature = SIG_TEXT_X_PHP;
-    if (!signature && c == 'd' && REQUEST_SUFFIX_MATCH(sig_embed)) signature = SIG_EMBED_TAG;
-    if (!signature && c == '"' && REQUEST_SUFFIX_MATCH(sig_base64_dq)) signature = SIG_BASE64_ATTR_DQ;
-    if (!signature && c == '\'' && REQUEST_SUFFIX_MATCH(sig_base64_sq)) signature = SIG_BASE64_ATTR_SQ;
-    // if (!signature && c == '>' && REQUEST_SUFFIX_MATCH(sig_file_name)) signature = SIG_FILE_NAME_TAG;
-    if (!signature && c == '/' && REQUEST_SUFFIX_MATCH(sig_trav_raw)) signature = SIG_TRAVERSAL_RAW;
-    if (!signature && c == '\\' && REQUEST_SUFFIX_MATCH(sig_trav_backslash)) signature = SIG_TRAVERSAL_RAW;
-    if (!signature && c == '/' && REQUEST_SUFFIX_MATCH(sig_trav_dec_dot_raw_slash)) signature = SIG_TRAVERSAL_ENTITY;
-    if (!signature && c == ';' && REQUEST_SUFFIX_MATCH(sig_trav_dec_dot_entity_slash)) signature = SIG_TRAVERSAL_ENTITY;
-    if (!signature && c == '/' && REQUEST_SUFFIX_MATCH(sig_trav_hex_dot_raw_slash)) signature = SIG_TRAVERSAL_ENTITY;
-    if (!signature && c == ';' && REQUEST_SUFFIX_MATCH(sig_trav_hex_dot_entity_slash)) signature = SIG_TRAVERSAL_ENTITY;
-    if (!signature && c == ';' && REQUEST_SUFFIX_MATCH(sig_trav_raw_dot_dec_slash)) signature = SIG_TRAVERSAL_ENTITY;
-    if (!signature && c == ';' && REQUEST_SUFFIX_MATCH(sig_trav_raw_dot_hex_slash)) signature = SIG_TRAVERSAL_ENTITY;
-    if (!signature && c == ';' && REQUEST_SUFFIX_MATCH(sig_trav_named_entities)) signature = SIG_TRAVERSAL_ENTITY;
-    if (!signature && c == ';' && REQUEST_SUFFIX_MATCH(sig_trav_upper_hex)) signature = SIG_TRAVERSAL_ENTITY;
-
-    if (!signature)
-        return;
-
-    ctx->read_signature_flags |= signature;
+    __u32 triggered_rules = exact_rules | folded_rules;
+    __u32 verdict_flags = exact_flags | folded_flags;
+    ctx->read_signature_flags |= matches;
     if (state->parser_mode != PARSER_DISABLED && state->request_started) {
-        state->is_malicious = 1;
-        state->first_signature = signature;
-        state->inspection_done = 1;
-        update_request_verdict(ctx, VERDICT_MALICIOUS,
+        state->matched_signatures |= matches;
+        if (!state->first_signature)
+            state->first_signature = verdict_flags;
+        state->matched_rules |= triggered_rules;
+        state->is_malicious = state->matched_rules != 0;
+        update_request_verdict(ctx, state->is_malicious ? VERDICT_MALICIOUS : VERDICT_PENDING,
             state->correlation_known ? CORRELATION_RELIABLE : CORRELATION_UNKNOWN,
-            INSPECTION_STOPPED_AFTER_MATCH, TRACKING_INCOMPLETE);
-        emit_detection(ctx, signature, state->correlation_known);
+            INSPECTION_INCOMPLETE, TRACKING_INCOMPLETE);
+        emit_detection(ctx, matches, state->matched_rules, state->is_malicious,
+                       state->correlation_known);
     } else {
-        ctx->degraded_match_done = 1;
-        emit_detection(ctx, signature, 0);
+        emit_detection(ctx, matches, triggered_rules, triggered_rules != 0, 0);
+        if (triggered_rules)
+            ctx->degraded_match_done = 1;
     }
 }
 
@@ -474,6 +506,8 @@ static __always_inline void reset_request(struct conn_state *state)
 {
     state->parser_mode = PARSER_REQUEST_LINE;
     state->request_length = 0;
+    state->exact_matcher_state = 0;
+    state->folded_matcher_state = 0;
     state->body_remaining = 0;
     state->line_len = 0;
     state->header_name_len = 0;
@@ -496,6 +530,9 @@ static __always_inline void reset_request(struct conn_state *state)
     state->request_flags = 0;
     state->reported_flags = 0;
     state->first_signature = 0;
+    state->matched_signatures = 0;
+    state->matched_rules = 0;
+    __builtin_memset(state->rule_seen, 0, sizeof(state->rule_seen));
     state->request_scan_window_len = 0;
     __builtin_memset(state->request_scan_window, 0, sizeof(state->request_scan_window));
 }
@@ -513,7 +550,6 @@ static __always_inline int emit_request(struct parser_ctx *ctx, __u16 flags,
         return -1;
     }
 
-    __builtin_memset(event, 0, sizeof(*event));
     event->tgid = ctx->tgid;
     event->request_length = ctx->state->request_length;
     event->ssl = ctx->ssl;
@@ -521,15 +557,14 @@ static __always_inline int emit_request(struct parser_ctx *ctx, __u16 flags,
     event->flags = flags;
     event->request_sequence = ctx->state->correlation_known ?
         ctx->state->active_request_sequence : 0;
-    event->signature_flags = ctx->state->first_signature;
-    event->matched_rules = 0;
+    event->signature_flags = ctx->state->matched_signatures;
+    event->matched_rules = ctx->state->matched_rules;
     event->is_malicious = ctx->state->is_malicious;
     event->first_signature = ctx->state->first_signature;
+    event->matched_signatures = ctx->state->matched_signatures;
     event->correlation_status = ctx->state->correlation_known ?
         CORRELATION_RELIABLE : CORRELATION_UNKNOWN;
-    event->inspection_status = ctx->state->is_malicious ?
-        INSPECTION_STOPPED_AFTER_MATCH :
-        (complete ? INSPECTION_COMPLETE : INSPECTION_INCOMPLETE);
+    event->inspection_status = complete ? INSPECTION_COMPLETE : INSPECTION_INCOMPLETE;
     event->tracking_status = complete ? TRACKING_COMPLETE : TRACKING_INCOMPLETE;
 
     __u32 method_len = ctx->state->method_len;
@@ -583,7 +618,7 @@ static __always_inline void parser_error(struct parser_ctx *ctx, __u16 flags)
     update_request_verdict(ctx,
         ctx->state->is_malicious ? VERDICT_MALICIOUS : VERDICT_INCOMPLETE,
         ctx->state->correlation_known ? CORRELATION_RELIABLE : CORRELATION_UNKNOWN,
-        ctx->state->is_malicious ? INSPECTION_STOPPED_AFTER_MATCH : INSPECTION_INCOMPLETE,
+        INSPECTION_INCOMPLETE,
         TRACKING_INCOMPLETE);
     ctx->state->correlation_known = 0;
     if (!ctx->state->parser_error_reported ||
@@ -600,7 +635,7 @@ static __always_inline void complete_request(struct parser_ctx *ctx)
     update_request_verdict(ctx,
         ctx->state->is_malicious ? VERDICT_MALICIOUS : VERDICT_CLEAN,
         CORRELATION_RELIABLE,
-        ctx->state->is_malicious ? INSPECTION_STOPPED_AFTER_MATCH : INSPECTION_COMPLETE,
+        INSPECTION_COMPLETE,
         TRACKING_COMPLETE);
     if (emit_request(ctx, ctx->state->request_flags, 1) != 0) {
         /* The byte boundary is still known, so preserve synchronization. */
@@ -630,7 +665,7 @@ static __always_inline int finish_line(struct parser_ctx *ctx)
         update_request_verdict(ctx,
             state->is_malicious ? VERDICT_MALICIOUS : VERDICT_PENDING,
             CORRELATION_RELIABLE,
-            state->is_malicious ? INSPECTION_STOPPED_AFTER_MATCH : INSPECTION_INCOMPLETE,
+            INSPECTION_INCOMPLETE,
             TRACKING_INCOMPLETE);
     } else if (state->parser_mode == PARSER_HEADERS) {
         if (state->line_len == 0) {
@@ -816,6 +851,35 @@ static long parse_one_byte(__u32 i, void *opaque)
     return 0;
 }
 
+static __always_inline void emit_raw_chunk(struct parser_ctx *parser, __u64 seq,
+                                             __u32 returned_len, __u32 offset,
+                                             __u32 chunk_index, __u32 expected_chunks,
+                                             __u32 data_len, __u32 flags)
+{
+    struct raw_chunk_event *event = bpf_ringbuf_reserve(&raw_events, sizeof(*event), 0);
+    struct request_counters *counters = get_request_counters();
+    if (!event) { if (counters) counters->raw_ringbuf_drops++; return; }
+    event->tgid = parser->tgid;
+    event->tid = (__u32)bpf_get_current_pid_tgid();
+    event->ssl = parser->ssl;
+    event->read_sequence = seq;
+    event->timestamp_ns = parser->timestamp_ns;
+    event->read_total_len = returned_len;
+    event->read_offset = offset;
+    event->chunk_index = chunk_index;
+    event->expected_chunk_count = expected_chunks;
+    event->data_len = data_len;
+    event->flags = flags;
+    event->event_type = 0;
+    if (bpf_probe_read_kernel(event->data, data_len, parser->scratch->data) != 0) {
+        if (counters) counters->raw_capture_failures++;
+        bpf_ringbuf_discard(event, 0);
+        return;
+    }
+    bpf_ringbuf_submit(event, 0);
+    if (counters) { counters->raw_chunks_submitted++; counters->raw_bytes_submitted += data_len; }
+}
+
 SEC("uprobe/SSL_read")
 int ssl_read_entry(struct pt_regs *ctx)
 {
@@ -855,6 +919,10 @@ int ssl_read_return(struct pt_regs *ctx)
         safe_len = MAX_INSPECT_SIZE;
         capture_flags |= REQUEST_FLAG_CAPTURE_TRUNCATED;
     }
+    if (capture_flags & REQUEST_FLAG_CAPTURE_TRUNCATED) {
+        struct request_counters *counters = get_request_counters();
+        if (counters) counters->raw_capture_truncated++;
+    }
 
     __u32 zero = 0;
     struct scan_buffer *scratch = bpf_map_lookup_elem(&scan_buffers, &zero);
@@ -880,6 +948,8 @@ int ssl_read_return(struct pt_regs *ctx)
     if (!state)
         goto cleanup;
 
+    state->read_sequence++;
+    __u64 read_sequence = state->read_sequence;
     struct parser_ctx parser = {
         .state = state,
         .scratch = scratch,
@@ -900,7 +970,6 @@ int ssl_read_return(struct pt_regs *ctx)
     }
 
     /* Process up to 16 KiB in four verifier-friendly 4 KiB chunks. */
-#pragma unroll
     for (int chunk = 0; chunk < MAX_INSPECT_SIZE / MAX_DATA_SIZE; chunk++) {
         __u32 offset = chunk * MAX_DATA_SIZE;
         if (offset >= safe_len)
@@ -912,8 +981,14 @@ int ssl_read_return(struct pt_regs *ctx)
         if (bpf_probe_read_user(scratch->data, chunk_len,
                                 (const void *)user_addr) != 0) {
             capture_flags |= REQUEST_FLAG_CAPTURE_TRUNCATED;
+            struct request_counters *counters = get_request_counters();
+            if (counters) counters->raw_capture_failures++;
             break;
         }
+        __u32 chunk_index = offset / MAX_DATA_SIZE;
+        __u32 expected_chunks = (safe_len + MAX_DATA_SIZE - 1) / MAX_DATA_SIZE;
+        emit_raw_chunk(&parser, read_sequence, returned_len, offset, chunk_index,
+                       expected_chunks, chunk_len, capture_flags);
         parser.read_len = chunk_len;
         parser.read_offset = offset;
         long parser_result = bpf_loop(chunk_len, parse_one_byte, &parser, 0);
@@ -927,7 +1002,7 @@ int ssl_read_return(struct pt_regs *ctx)
         state->parser_mode != PARSER_DISABLED) {
         update_request_verdict(&parser, VERDICT_MALICIOUS,
             state->correlation_known ? CORRELATION_RELIABLE : CORRELATION_UNKNOWN,
-            INSPECTION_STOPPED_AFTER_MATCH, TRACKING_INCOMPLETE);
+            INSPECTION_INCOMPLETE, TRACKING_INCOMPLETE);
     }
     state->last_seen_ns = now;
     if (capture_flags)
@@ -944,11 +1019,16 @@ int ssl_free_entry(struct pt_regs *ctx)
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     __u64 ssl = (__u64)PT_REGS_PARM1(ctx);
-    struct conn_key key = {
-        .pid = pid,
-        .pad = 0,
-        .ssl = ssl,
-    };
+    struct conn_key key = { .pid = pid, .pad = 0, .ssl = ssl };
+    struct raw_chunk_event *event = bpf_ringbuf_reserve(&raw_events, sizeof(*event), 0);
+    if (event) {
+        event->tgid = pid; event->tid = (__u32)pid_tgid; event->ssl = ssl;
+        event->timestamp_ns = bpf_ktime_get_ns(); event->event_type = 1;
+        bpf_ringbuf_submit(event, 0);
+    } else {
+        struct request_counters *counters = get_request_counters();
+        if (counters) counters->raw_ringbuf_drops++;
+    }
     bpf_map_delete_elem(&conn_states, &key);
     return 0;
 }

@@ -5,7 +5,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -21,11 +21,11 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"github.com/cilium/ebpf/rlimit"
 	"golang.org/x/sys/unix"
 )
 
 // Keep this metadata layout in sync with struct ssl_event in bpf/ssl.bpf.c.
-// No plaintext payload is sent to user space; the event contains detection metadata only.
 type SSLEvent struct {
 	PID             uint32
 	TID             uint32
@@ -61,6 +61,7 @@ type RequestEvent struct {
 	MatchedRules      uint32
 	IsMalicious       uint32
 	FirstSignature    uint32
+	MatchedSignatures uint32
 	Correlation       uint32
 	Inspection        uint32
 	Tracking          uint32
@@ -68,26 +69,7 @@ type RequestEvent struct {
 	URI               [256]byte
 	HTTPVersion       [16]byte
 	PadEnd            uint32
-}
-
-type RequestRecord struct {
-	Timestamp             string   `json:"timestamp"`
-	TimestampMonotonic    uint64   `json:"timestamp_monotonic_ns"`
-	TGID                  uint32   `json:"tgid"`
-	SSL                   string   `json:"ssl"`
-	RequestSequence       uint64   `json:"request_sequence"`
-	RequestLength         uint32   `json:"request_length"`
-	Method                string   `json:"method"`
-	URI                   string   `json:"uri"`
-	HTTPVersion           string   `json:"http_version"`
-	IsMalicious           bool     `json:"is_malicious"`
-	MatchedSignatures     []string `json:"matched_signatures"`
-	MatchedRules          []string `json:"matched_rules"`
-	FirstMatchedSignature string   `json:"first_matched_signature,omitempty"`
-	TrackingStatus        string   `json:"tracking_status"`
-	CorrelationStatus     string   `json:"correlation_status"`
-	InspectionStatus      string   `json:"inspection_status"`
-	RequestFlags          []string `json:"request_flags"`
+	PadEnd2           uint32
 }
 
 type RequestCounters struct {
@@ -101,6 +83,11 @@ type RequestCounters struct {
 	UnattributedDetections uint64
 	VerdictUpdates         uint64
 	VerdictUpdateFailures  uint64
+	RawChunksSubmitted     uint64
+	RawRingbufDrops        uint64
+	RawBytesSubmitted      uint64
+	RawCaptureTruncated    uint64
+	RawCaptureFailures     uint64
 }
 
 // The binary layout must match verdict_key and verdict_value in ssl.bpf.c.
@@ -285,60 +272,25 @@ func requestFlagNames(flags uint16) []string {
 	return names
 }
 
-// These bits must match the macros in bpf/ssl.bpf.c.
-const (
-	sigTextXPHP uint32 = 1 << iota
-	sigEmbedTag
-	sigBase64DoubleQuoted
-	sigBase64SingleQuoted
-	sigFileNameTag
-	sigTraversalRaw
-	sigTraversalEntity
-)
-
-const (
-	ruleOJSFileContext uint32 = 1 << iota
-	ruleOJSTraversal
-	ruleOJSCVECombo
-)
-
 func signatureNames(flags uint32) []string {
 	var names []string
-	if flags&sigTextXPHP != 0 {
-		names = append(names, "TEXT_X_PHP")
+	for bit, name := range signatureLabels {
+		if flags&bit != 0 {
+			names = append(names, name)
+		}
 	}
-	if flags&sigEmbedTag != 0 {
-		names = append(names, "EMBED_TAG")
-	}
-	if flags&sigBase64DoubleQuoted != 0 {
-		names = append(names, "BASE64_ATTR_DOUBLE_QUOTED")
-	}
-	if flags&sigBase64SingleQuoted != 0 {
-		names = append(names, "BASE64_ATTR_SINGLE_QUOTED")
-	}
-	if flags&sigFileNameTag != 0 {
-		names = append(names, "FILE_NAME_TAG")
-	}
-	if flags&sigTraversalRaw != 0 {
-		names = append(names, "TRAVERSAL_RAW")
-	}
-	if flags&sigTraversalEntity != 0 {
-		names = append(names, "TRAVERSAL_XML_ENTITY")
-	}
+	sort.Strings(names)
 	return names
 }
 
 func ruleNames(flags uint32) []string {
 	var names []string
-	if flags&ruleOJSFileContext != 0 {
-		names = append(names, "OJS-FILE-001")
+	for bit, name := range ruleLabels {
+		if flags&bit != 0 {
+			names = append(names, name)
+		}
 	}
-	if flags&ruleOJSTraversal != 0 {
-		names = append(names, "OJS-TRAVERSAL-001")
-	}
-	if flags&ruleOJSCVECombo != 0 {
-		names = append(names, "OJS-CVE-001")
-	}
+	sort.Strings(names)
 	return names
 }
 
@@ -351,10 +303,18 @@ func main() {
 	if defaultNginxGroup == "" {
 		defaultNginxGroup = "www-data"
 	}
+	rulesDirDefault := os.Getenv("EBPF_WAF_RULES_DIR")
+	if rulesDirDefault == "" {
+		rulesDirDefault = "rules"
+	}
 	verdictMapPath := flag.String("verdict-map", defaultMapPath, "bpffs path shared with the Nginx enforcement module")
 	nginxGroup := flag.String("nginx-group", defaultNginxGroup, "group allowed to read and consume pinned verdicts")
+	rulesDir := flag.String("rules", rulesDirDefault, "directory containing one YAML file per WAF rule")
 	unpinOnExit := flag.Bool("unpin-verdict-map-on-exit", false, "remove this verdict-map pin on exit (for isolated tests only)")
 	flag.Parse()
+	if err := rlimit.RemoveMemlock(); err != nil {
+		log.Printf("BPF memlock limit unchanged: %v (map creation may require additional privileges)", err)
+	}
 
 	spec, err := loadBpf()
 	if err != nil {
@@ -400,6 +360,17 @@ func main() {
 		}
 
 		os.Exit(1)
+	}
+	if binary.Size(RequestEvent{}) != 368 || binary.Size(RawChunkEvent{}) != 4160 ||
+		objs.SignaturePatterns.ValueSize() != uint32(binary.Size(runtimeSignature{})) ||
+		objs.AutomatonTransitions.ValueSize() != uint32(binary.Size(runtimeAutomatonTransition{})) ||
+		objs.RuleConfigs.ValueSize() != uint32(binary.Size(runtimeRule{})) {
+		log.Fatalf("C/Go BPF ABI mismatch: request=%d raw=%d signature=%d/%d rule=%d/%d automaton=%d/%d",
+			binary.Size(RequestEvent{}), binary.Size(RawChunkEvent{}), objs.SignaturePatterns.ValueSize(), binary.Size(runtimeSignature{}),
+			objs.RuleConfigs.ValueSize(), binary.Size(runtimeRule{}), objs.AutomatonTransitions.ValueSize(), binary.Size(runtimeAutomatonTransition{}))
+	}
+	if err := applyRules(*rulesDir, objs.SignaturePatterns, objs.RuleConfigs, objs.AutomatonTransitions); err != nil {
+		log.Fatalf("loading WAF rules: %v", err)
 	}
 	mapPinned := pinnedVerdicts != nil
 	if pinnedVerdicts != nil {
@@ -480,11 +451,40 @@ func main() {
 	}
 	defer requestRd.Close()
 
-	dataset, err := os.OpenFile("dataset.jsonl", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	requestLog, err := openRequestLogger("logs")
 	if err != nil {
-		log.Fatalf("opening dataset.jsonl: %v", err)
+		log.Fatalf("opening request logs: %v", err)
 	}
-	defer dataset.Close()
+	coordinator := newRequestCoordinator(requestLog)
+	rawRd, err := ringbuf.NewReader(objs.RawEvents)
+	if err != nil {
+		log.Fatalf("creating raw-event ring buffer reader: %v", err)
+	}
+	defer rawRd.Close()
+	rawDone := make(chan struct{})
+	go func() {
+		defer close(rawDone)
+		for {
+			record, err := rawRd.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					return
+				}
+				log.Printf("reading raw ring buffer: %v", err)
+				continue
+			}
+			var event RawChunkEvent
+			if len(record.RawSample) != binary.Size(event) {
+				log.Printf("unexpected raw event size: got=%d want=%d", len(record.RawSample), binary.Size(event))
+				continue
+			}
+			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
+				log.Printf("decoding raw event: %v", err)
+				continue
+			}
+			coordinator.acceptRaw(event)
+		}
+	}()
 
 	requestDone := make(chan struct{})
 	go func() {
@@ -508,62 +508,34 @@ func main() {
 				log.Printf("decoding request event: %v", err)
 				continue
 			}
+			if event.MethodLength > uint16(len(event.Method)) || event.URILength > uint16(len(event.URI)) || event.HTTPVersionLength > uint16(len(event.HTTPVersion)) {
+				log.Printf("invalid request event string lengths tgid=%d ssl=0x%x seq=%d", event.TGID, event.SSL, event.RequestSequence)
+				continue
+			}
+			coordinator.acceptKernelEvent(event)
 			if event.Flags != 0 {
 				log.Printf("REQUEST TRACKING DIAGNOSTIC tgid=%d ssl=0x%x seq=%d malicious=%t signature=%s correlation=%s tracking=%s reason=%s",
 					event.TGID, event.SSL, event.RequestSequence, event.IsMalicious != 0,
-					strings.Join(signatureNames(event.FirstSignature), ","), correlationName(event.Correlation),
+					strings.Join(signatureNames(event.MatchedSignatures), ","), correlationName(event.Correlation),
 					trackingName(event.Tracking), requestDiagnostic(event.Flags))
 			}
-			// Parser diagnostics are not completed request records. Preserve a malicious
-			// diagnostic in the terminal log, while only complete tracker events enter JSONL.
+			// The coordinator records incomplete diagnostics and joins complete raw requests.
 			if event.Tracking != 1 {
 				if event.IsMalicious != 0 {
 					log.Printf("DETECTION tgid=%d ssl=0x%x seq=%d first_signature=%s correlation=%s tracking=%s inspection=%s flags=%s",
 						event.TGID, event.SSL, event.RequestSequence,
-						strings.Join(signatureNames(event.FirstSignature), ","), correlationName(event.Correlation),
+						strings.Join(signatureNames(event.MatchedSignatures), ","), correlationName(event.Correlation),
 						trackingName(event.Tracking), inspectionName(event.Inspection), requestDiagnostic(event.Flags))
 				}
 				continue
 			}
 
-			if event.MethodLength > uint16(len(event.Method)) || event.URILength > uint16(len(event.URI)) || event.HTTPVersionLength > uint16(len(event.HTTPVersion)) {
-				log.Printf("invalid request event string lengths tgid=%d ssl=0x%x seq=%d", event.TGID, event.SSL, event.RequestSequence)
-				continue
-			}
-			request := RequestRecord{
-				Timestamp:             time.Now().UTC().Format(time.RFC3339Nano),
-				TimestampMonotonic:    event.TimestampNS,
-				TGID:                  event.TGID,
-				SSL:                   fmt.Sprintf("0x%x", event.SSL),
-				RequestSequence:       event.RequestSequence,
-				RequestLength:         event.RequestLength,
-				Method:                string(event.Method[:event.MethodLength]),
-				URI:                   string(event.URI[:event.URILength]),
-				HTTPVersion:           string(event.HTTPVersion[:event.HTTPVersionLength]),
-				IsMalicious:           event.IsMalicious != 0,
-				MatchedSignatures:     signatureNames(event.SignatureFlags),
-				MatchedRules:          ruleNames(event.MatchedRules),
-				FirstMatchedSignature: strings.Join(signatureNames(event.FirstSignature), ","),
-				TrackingStatus:        trackingName(event.Tracking),
-				CorrelationStatus:     correlationName(event.Correlation),
-				InspectionStatus:      inspectionName(event.Inspection),
-				RequestFlags:          requestFlagNames(event.Flags),
-			}
-			encoded, err := json.Marshal(request)
-			if err != nil {
-				log.Printf("encoding request JSON: %v", err)
-				continue
-			}
-			if _, err := dataset.Write(append(encoded, '\n')); err != nil {
-				log.Printf("writing dataset.jsonl: %v", err)
-				continue
-			}
-			if err := dataset.Sync(); err != nil {
-				log.Printf("syncing dataset.jsonl: %v", err)
-			}
+			requestMethod := string(event.Method[:event.MethodLength])
+			requestURI := string(event.URI[:event.URILength])
+			requestVersion := string(event.HTTPVersion[:event.HTTPVersionLength])
 			log.Printf("REQUEST tgid=%d ssl=0x%x seq=%d %s %s %s bytes=%d malicious=%t signatures=[%s] rules=[%s]",
-				event.TGID, event.SSL, event.RequestSequence, request.Method, request.URI, request.HTTPVersion, event.RequestLength,
-				request.IsMalicious, strings.Join(request.MatchedSignatures, ","), strings.Join(request.MatchedRules, ","))
+				event.TGID, event.SSL, event.RequestSequence, requestMethod, requestURI, requestVersion, event.RequestLength,
+				event.IsMalicious != 0, strings.Join(signatureNames(event.MatchedSignatures), ","), strings.Join(ruleNames(event.MatchedRules), ","))
 		}
 	}()
 
@@ -574,12 +546,15 @@ func main() {
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	shutdown := make(chan struct{})
 	go cleanupExpiredVerdicts(objs.RequestVerdicts, shutdown)
+	coordinatorDone := make(chan struct{})
+	go func() { defer close(coordinatorDone); coordinator.run(shutdown) }()
 	go func() {
 		<-sig
 		log.Println("Stopping detector...")
 		close(shutdown)
 		_ = rd.Close()
 		_ = requestRd.Close()
+		_ = rawRd.Close()
 	}()
 
 readLoop:
@@ -607,6 +582,7 @@ readLoop:
 			log.Printf("decoding eBPF detection event: %v", err)
 			continue
 		}
+		coordinator.acceptDetection(event)
 		if event.IsMalicious == 0 || event.FirstSignature == 0 {
 			continue
 		}
@@ -632,6 +608,10 @@ readLoop:
 	log.Println("Detector stopped")
 	_ = requestRd.Close()
 	<-requestDone
+	_ = rawRd.Close()
+	<-rawDone
+	<-coordinatorDone
+	requestLog.Close()
 	zero := uint32(0)
 	var perCPUCounters []RequestCounters
 	if err := objs.RequestCountersMap.Lookup(&zero, &perCPUCounters); err != nil {
@@ -649,12 +629,17 @@ readLoop:
 			counters.UnattributedDetections += cpu.UnattributedDetections
 			counters.VerdictUpdates += cpu.VerdictUpdates
 			counters.VerdictUpdateFailures += cpu.VerdictUpdateFailures
+			counters.RawChunksSubmitted += cpu.RawChunksSubmitted
+			counters.RawRingbufDrops += cpu.RawRingbufDrops
+			counters.RawBytesSubmitted += cpu.RawBytesSubmitted
+			counters.RawCaptureTruncated += cpu.RawCaptureTruncated
+			counters.RawCaptureFailures += cpu.RawCaptureFailures
 		}
-		log.Printf("REQUEST TRACKER SUMMARY identified=%d errors=%d unsupported=%d oversized=%d capture_truncated=%d ringbuf_drops=%d detection_drops=%d unattributed_detections=%d verdict_updates=%d verdict_update_failures=%d",
+		log.Printf("REQUEST TRACKER SUMMARY identified=%d errors=%d unsupported=%d oversized=%d capture_truncated=%d ringbuf_drops=%d detection_drops=%d unattributed_detections=%d verdict_updates=%d verdict_update_failures=%d raw_chunks=%d raw_drops=%d raw_bytes=%d raw_capture_truncated=%d raw_capture_failures=%d",
 			counters.Identified, counters.ParserErrors, counters.Unsupported,
 			counters.Oversized, counters.CaptureTruncated, counters.RingbufDrops,
 			counters.DetectionDrops, counters.UnattributedDetections,
-			counters.VerdictUpdates, counters.VerdictUpdateFailures)
+			counters.VerdictUpdates, counters.VerdictUpdateFailures, counters.RawChunksSubmitted, counters.RawRingbufDrops, counters.RawBytesSubmitted, counters.RawCaptureTruncated, counters.RawCaptureFailures)
 	}
 	if *unpinOnExit {
 		pinned, err := ebpf.LoadPinnedMap(*verdictMapPath, nil)

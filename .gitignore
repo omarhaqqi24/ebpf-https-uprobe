@@ -36,6 +36,7 @@
 /tmp/
 /temp/
 *.tmp
+/logs/
 
 # Local environment and secrets
 .env
