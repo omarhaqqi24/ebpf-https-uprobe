@@ -16,11 +16,13 @@ import (
 )
 
 const (
-	maxRuntimeSignatures       = 32
-	maxRuntimeRules            = 32
-	maxPatternBytes            = 24
-	runtimeRuleAny       uint8 = 0
-	runtimeRuleAll       uint8 = 1
+	maxRuntimeSignatures = 32
+	maxRuntimeRules      = 32
+	maxPatternBytes      = 24
+	maxScopes            = 16
+	maxScopeName         = 64
+	maxRepeatMax         = 64
+	maxScopedStates      = 512
 )
 
 type RuleFile struct {
@@ -31,13 +33,31 @@ type RuleFile struct {
 	Enabled       *bool  `yaml:"enabled"`
 	Severity      string `yaml:"severity"`
 	Match         struct {
-		Operator string `yaml:"operator"`
+		Scope *RuleScope `yaml:"scope"`
 	} `yaml:"match"`
-	Signatures []struct {
-		ID            string `yaml:"id"`
-		Pattern       string `yaml:"pattern"`
-		CaseSensitive *bool  `yaml:"case_sensitive"`
-	} `yaml:"signatures"`
+	Signatures []RuleSignature `yaml:"signatures"`
+}
+type RuleScope struct {
+	Type string `yaml:"type"`
+	Name string `yaml:"name"`
+}
+type RuleSignature struct {
+	ID            string             `yaml:"id"`
+	Pattern       string             `yaml:"pattern"`
+	CaseSensitive *bool              `yaml:"case_sensitive"`
+	Matcher       *StructuredMatcher `yaml:"matcher"`
+}
+type StructuredMatcher struct {
+	Tokens []MatcherToken `yaml:"tokens"`
+}
+type MatcherToken struct {
+	Literal *string      `yaml:"literal"`
+	Repeat  *RepeatToken `yaml:"repeat"`
+}
+type RepeatToken struct {
+	Chars []string `yaml:"chars"`
+	Min   *int     `yaml:"min"`
+	Max   *int     `yaml:"max"`
 }
 
 type runtimeSignature struct {
@@ -52,8 +72,7 @@ type runtimeSignature struct {
 type runtimeRule struct {
 	SignatureMask uint32
 	Enabled       uint8
-	Operator      uint8
-	Pad           uint16
+	Pad           [3]uint8
 }
 type runtimeAutomatonTransition struct {
 	NextState uint32
@@ -93,6 +112,7 @@ func loadRules(dir string) ([]RuleFile, []runtimeSignature, []runtimeRule, error
 	runtimeSigs := make([]runtimeSignature, 0, maxRuntimeSignatures)
 	runtimeRules := make([]runtimeRule, 0, maxRuntimeRules)
 	seenRules := map[string]bool{}
+	seenSignatures := map[string]bool{}
 	for _, file := range files {
 		data, err := os.ReadFile(file)
 		if err != nil {
@@ -113,7 +133,6 @@ func loadRules(dir string) ([]RuleFile, []runtimeSignature, []runtimeRule, error
 		rule.ID = strings.TrimSpace(rule.ID)
 		rule.Name = strings.TrimSpace(rule.Name)
 		rule.Vulnerability = strings.TrimSpace(rule.Vulnerability)
-		op := strings.ToLower(strings.TrimSpace(rule.Match.Operator))
 		if rule.ID == "" || seenRules[rule.ID] {
 			return nil, nil, nil, fmt.Errorf("%s: id is empty or duplicated: %q", file, rule.ID)
 		}
@@ -127,8 +146,14 @@ func loadRules(dir string) ([]RuleFile, []runtimeSignature, []runtimeRule, error
 		if rule.Enabled == nil {
 			return nil, nil, nil, fmt.Errorf("%s: enabled is required", file)
 		}
-		if op != "any" {
-			return nil, nil, nil, fmt.Errorf("%s: match.operator must be any; all is not supported by the kernel matcher", file)
+		if rule.Match.Scope != nil {
+			sc := rule.Match.Scope
+			if (sc.Type != "http_header_value" && sc.Type != "http_body_parameter") || sc.Name == "" || len(sc.Name) > maxScopeName || !isASCII(sc.Name) {
+				return nil, nil, nil, fmt.Errorf("%s: scope must use a supported type and an ASCII name of 1..%d bytes", file, maxScopeName)
+			}
+			if sc.Type == "http_header_value" {
+				sc.Name = strings.ToLower(sc.Name)
+			}
 		}
 		if len(rule.Signatures) == 0 || len(rule.Signatures) > maxRuntimeSignatures {
 			return nil, nil, nil, fmt.Errorf("%s: signatures must contain 1..%d items", file, maxRuntimeSignatures)
@@ -143,25 +168,53 @@ func loadRules(dir string) ([]RuleFile, []runtimeSignature, []runtimeRule, error
 		if !*rule.Enabled {
 			rr.Enabled = 0
 		}
-		if op == "all" {
-			rr.Operator = runtimeRuleAll
-		} else {
-			rr.Operator = runtimeRuleAny
-		}
 		localIDs := map[string]bool{}
 		for _, item := range rule.Signatures {
 			sigID := strings.TrimSpace(item.ID)
-			if sigID == "" || localIDs[sigID] {
+			if sigID == "" || localIDs[sigID] || seenSignatures[sigID] {
 				return nil, nil, nil, fmt.Errorf("%s: signature id is empty or duplicated: %q", file, sigID)
 			}
 			localIDs[sigID] = true
-			pat := []byte(item.Pattern)
-			if len(pat) == 0 || len(pat) > maxPatternBytes {
-				return nil, nil, nil, fmt.Errorf("%s: signature %s pattern must be 1..%d bytes", file, sigID, maxPatternBytes)
+			seenSignatures[sigID] = true
+			if (item.Pattern == "") == (item.Matcher == nil) {
+				return nil, nil, nil, fmt.Errorf("%s: signature %s must define exactly one of pattern or matcher", file, sigID)
 			}
-			for _, b := range pat {
-				if b > 0x7f {
-					return nil, nil, nil, fmt.Errorf("%s: signature %s pattern must be ASCII", file, sigID)
+			pat := []byte(item.Pattern)
+			if item.Matcher == nil {
+				if len(pat) == 0 || len(pat) > maxPatternBytes {
+					return nil, nil, nil, fmt.Errorf("%s: signature %s pattern length invalid", file, sigID)
+				}
+				for _, b := range pat {
+					if b > 0x7f {
+						return nil, nil, nil, fmt.Errorf("%s: pattern must be ASCII", file)
+					}
+				}
+			} else if rule.Match.Scope == nil || len(item.Matcher.Tokens) == 0 {
+				return nil, nil, nil, fmt.Errorf("%s: structured matcher needs a field scope for %s", file, sigID)
+			} else {
+				for _, t := range item.Matcher.Tokens {
+					if (t.Literal == nil) == (t.Repeat == nil) {
+						return nil, nil, nil, fmt.Errorf("%s: token must define exactly one of literal or repeat", file)
+					}
+					if t.Literal != nil && (*t.Literal == "" || !isASCII(*t.Literal)) {
+						return nil, nil, nil, fmt.Errorf("%s: literal token must be non-empty ASCII", file)
+					}
+					if t.Repeat != nil {
+						rt := t.Repeat
+						if len(rt.Chars) == 0 || rt.Min == nil || *rt.Min < 0 {
+							return nil, nil, nil, fmt.Errorf("%s: repeat requires chars and non-negative min", file)
+						}
+						seen := map[byte]bool{}
+						for _, ch := range rt.Chars {
+							if len(ch) != 1 || ch[0] > 127 || seen[ch[0]] {
+								return nil, nil, nil, fmt.Errorf("%s: repeat chars must be distinct single-byte ASCII", file)
+							}
+							seen[ch[0]] = true
+						}
+						if rt.Max != nil && (*rt.Max < *rt.Min || *rt.Max > maxRepeatMax) {
+							return nil, nil, nil, fmt.Errorf("%s: repeat max must be >= min and <= %d", file, maxRepeatMax)
+						}
+					}
 				}
 			}
 			if len(runtimeSigs) >= maxRuntimeSignatures {
@@ -205,6 +258,9 @@ func asciiLower(b byte) byte {
 }
 
 func legacyVerdictMask(vulnerability, signatureID string, pattern []byte) uint32 {
+	if strings.EqualFold(vulnerability, "less_code_injection") {
+		return 1 << 7
+	}
 	if strings.EqualFold(vulnerability, "path_traversal") {
 		if bytes.Contains(pattern, []byte("&")) {
 			return 1 << 6
@@ -227,7 +283,222 @@ func legacyVerdictMask(vulnerability, signatureID string, pattern []byte) uint32
 	}
 }
 
-func applyRules(dir string, patterns, configs, transitions *ebpf.Map) error {
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+type scopeKey struct {
+	Type string
+	Name string
+}
+type runtimeScopeKey struct {
+	PrefixLen uint32
+	Kind      uint8
+	NameLen   uint8
+	Pad       uint16
+	Name      [maxScopeName]byte
+}
+
+func makeRuntimeScopeKey(k scopeKey) runtimeScopeKey {
+	var v runtimeScopeKey
+	if k.Type == "http_header_value" {
+		v.Kind = 1
+	} else {
+		v.Kind = 2
+	}
+	v.NameLen = uint8(len(k.Name))
+	v.PrefixLen = uint32((4 + len(k.Name)) * 8)
+	copy(v.Name[:], k.Name)
+	return v
+}
+func scopeIDMap(rules []RuleFile) (map[scopeKey]uint32, error) {
+	keys := map[scopeKey]bool{}
+	for _, r := range rules {
+		if r.Enabled != nil && *r.Enabled {
+			for _, sig := range r.Signatures {
+				if sig.Matcher != nil {
+					k := scopeKey{r.Match.Scope.Type, r.Match.Scope.Name}
+					keys[k] = true
+				}
+			}
+		}
+	}
+	ordered := make([]scopeKey, 0, len(keys))
+	for k := range keys {
+		ordered = append(ordered, k)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Type != ordered[j].Type {
+			return ordered[i].Type < ordered[j].Type
+		}
+		return ordered[i].Name < ordered[j].Name
+	})
+	if len(ordered) > maxScopes {
+		return nil, fmt.Errorf("configured structured scopes exceed %d", maxScopes)
+	}
+	ids := make(map[scopeKey]uint32, len(ordered))
+	for i, k := range ordered {
+		ids[k] = uint32(i + 1)
+	}
+	return ids, nil
+}
+func buildScopedTransitions(rules []RuleFile) (map[uint32]runtimeAutomatonTransition, error) {
+	ids, err := scopeIDMap(rules)
+	if err != nil {
+		return nil, err
+	}
+	type node struct {
+		edge   map[byte][]int
+		eps    []int
+		output runtimeAutomatonTransition
+	}
+	out := map[uint32]runtimeAutomatonTransition{}
+	for scope, id := range ids {
+		nodes := []node{{edge: map[byte][]int{}}}
+		roots := []int{}
+		for ri, r := range rules {
+			if r.Enabled == nil || !*r.Enabled || r.Match.Scope == nil || r.Match.Scope.Type != scope.Type || r.Match.Scope.Name != scope.Name {
+				continue
+			}
+			base := uint32(0)
+			for j := 0; j < ri; j++ {
+				base += uint32(len(rules[j].Signatures))
+			}
+			for si, sig := range r.Signatures {
+				if sig.Matcher == nil {
+					continue
+				}
+				root := len(nodes)
+				roots = append(roots, root)
+				nodes = append(nodes, node{edge: map[byte][]int{}})
+				cur := root
+				for _, tok := range sig.Matcher.Tokens {
+					if tok.Literal != nil {
+						for _, b := range []byte(*tok.Literal) {
+							n := len(nodes)
+							nodes = append(nodes, node{edge: map[byte][]int{}})
+							nodes[cur].edge[b] = append(nodes[cur].edge[b], n)
+							cur = n
+						}
+						continue
+					}
+					rt := tok.Repeat
+					addSet := func(from, to int) {
+						for _, ch := range rt.Chars {
+							nodes[from].edge[ch[0]] = append(nodes[from].edge[ch[0]], to)
+						}
+					}
+					for n := 0; n < *rt.Min; n++ {
+						next := len(nodes)
+						nodes = append(nodes, node{edge: map[byte][]int{}})
+						addSet(cur, next)
+						cur = next
+					}
+					if rt.Max == nil {
+						loop := len(nodes)
+						nodes = append(nodes, node{edge: map[byte][]int{}})
+						nodes[cur].eps = append(nodes[cur].eps, loop)
+						addSet(cur, cur)
+						cur = loop
+					} else {
+						for n := *rt.Min; n < *rt.Max; n++ {
+							next := len(nodes)
+							nodes = append(nodes, node{edge: map[byte][]int{}})
+							nodes[cur].eps = append(nodes[cur].eps, next)
+							addSet(cur, next)
+							cur = next
+						}
+						exit := len(nodes)
+						nodes = append(nodes, node{edge: map[byte][]int{}})
+						nodes[cur].eps = append(nodes[cur].eps, exit)
+						cur = exit
+					}
+				}
+				nodes[cur].output.Matches = 1 << (base + uint32(si))
+				nodes[cur].output.Rules = 1 << uint32(ri)
+				nodes[cur].output.Flags = legacyVerdictMask(r.Vulnerability, sig.ID, nil)
+			}
+		}
+		if len(roots) == 0 {
+			continue
+		}
+		closure := func(a []bool) {
+			for again := true; again; {
+				again = false
+				for i, on := range a {
+					if on {
+						for _, n := range nodes[i].eps {
+							if !a[n] {
+								a[n] = true
+								again = true
+							}
+						}
+					}
+				}
+			}
+		}
+		key := func(a []bool) string {
+			b := make([]byte, len(a))
+			for i, v := range a {
+				if v {
+					b[i] = 1
+				}
+			}
+			return string(b)
+		}
+		start := make([]bool, len(nodes))
+		for _, r := range roots {
+			start[r] = true
+		}
+		closure(start)
+		sets := [][]bool{start}
+		sid := map[string]int{key(start): 0}
+		for st := 0; st < len(sets); st++ {
+			for v := 0; v < 256; v++ {
+				next := make([]bool, len(nodes))
+				for i, on := range sets[st] {
+					if on {
+						for _, n := range nodes[i].edge[byte(v)] {
+							next[n] = true
+						}
+					}
+				}
+				for _, r := range roots {
+					next[r] = true
+				}
+				closure(next)
+				k := key(next)
+				n, ok := sid[k]
+				if !ok {
+					if len(sets) >= maxScopedStates {
+						return nil, fmt.Errorf("scope %s/%s matcher exceeds %d states", scope.Type, scope.Name, maxScopedStates)
+					}
+					n = len(sets)
+					sid[k] = n
+					sets = append(sets, next)
+				}
+				tr := runtimeAutomatonTransition{NextState: uint32(n)}
+				for i, on := range next {
+					if on {
+						tr.Matches |= nodes[i].output.Matches
+						tr.Rules |= nodes[i].output.Rules
+						tr.Flags |= nodes[i].output.Flags
+					}
+				}
+				mapKey := (id*maxScopedStates+uint32(st))*256 + uint32(v)
+				out[mapKey] = tr
+			}
+		}
+	}
+	return out, nil
+}
+
+func applyRules(dir string, patterns, configs, transitions, scoped, scopes *ebpf.Map) error {
 	rules, sigs, ruleConfigs, err := loadRules(dir)
 	if err != nil {
 		return err
@@ -235,6 +506,28 @@ func applyRules(dir string, patterns, configs, transitions *ebpf.Map) error {
 	compiled, err := buildAutomatonTransitions(rules)
 	if err != nil {
 		return err
+	}
+	scopedCompiled, err := buildScopedTransitions(rules)
+	if err != nil {
+		return err
+	}
+	scopeIDs, err := scopeIDMap(rules)
+	if err != nil {
+		return err
+	}
+	if len(scopedCompiled) > maxScopes*maxScopedStates*256 {
+		return fmt.Errorf("scoped transition count exceeds configured capacity")
+	}
+	for scope, id := range scopeIDs {
+		key := makeRuntimeScopeKey(scope)
+		if err := scopes.Update(&key, id, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("loading scope %s/%s: %w", scope.Type, scope.Name, err)
+		}
+	}
+	for key, value := range scopedCompiled {
+		if err := scoped.Update(key, value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("loading scoped transition %d: %w", key, err)
+		}
 	}
 	for key, value := range compiled {
 		if err := transitions.Update(key, value, ebpf.UpdateAny); err != nil {
@@ -259,7 +552,7 @@ func applyRules(dir string, patterns, configs, transitions *ebpf.Map) error {
 			return fmt.Errorf("loading rule index %d: %w", i, err)
 		}
 	}
-	log.Printf("loaded eBPF rules=%d signatures=%d", len(rules), len(sigs))
+	log.Printf("loaded eBPF rules=%d signatures=%d structured_scopes=%d", len(rules), len(sigs), len(scopeIDs))
 	return nil
 }
 
@@ -271,6 +564,10 @@ func buildAutomatonTransitions(rules []RuleFile) (map[uint32]runtimeAutomatonTra
 		for ruleIndex, rule := range rules {
 			ruleEnabled := rule.Enabled != nil && *rule.Enabled
 			for _, signature := range rule.Signatures {
+				if signature.Matcher != nil {
+					sigIndex++
+					continue
+				}
 				caseSensitive := signature.CaseSensitive == nil || *signature.CaseSensitive
 				if ruleEnabled && caseSensitive == (mode == 0) {
 					state := 0

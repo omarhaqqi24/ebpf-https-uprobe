@@ -14,6 +14,7 @@
 
 #define EBPF_WAF_SIG_TRAVERSAL_RAW   (1U << 5)
 #define EBPF_WAF_SIG_TRAVERSAL_ENTITY (1U << 6)
+#define EBPF_WAF_SIG_OJS_LESS_CODE_INJECTION (1U << 7)
 
 enum {
     EBPF_WAF_OBSERVE = 0,
@@ -115,6 +116,7 @@ static ngx_conf_enum_t ngx_http_ebpf_waf_fallbacks[] = {
 static ngx_conf_bitmask_t ngx_http_ebpf_waf_signatures[] = {
     { ngx_string("TRAVERSAL_RAW"), EBPF_WAF_SIG_TRAVERSAL_RAW },
     { ngx_string("TRAVERSAL_XML_ENTITY"), EBPF_WAF_SIG_TRAVERSAL_ENTITY },
+    { ngx_string("OJS_LESS_CODE_INJECTION"), EBPF_WAF_SIG_OJS_LESS_CODE_INJECTION },
     { ngx_null_string, 0 }
 };
 
@@ -495,7 +497,8 @@ ngx_http_ebpf_waf_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->fallback, prev->fallback, EBPF_WAF_FALLBACK_ALLOW);
     ngx_conf_merge_bitmask_value(conf->blocking_signatures,
         prev->blocking_signatures,
-        EBPF_WAF_SIG_TRAVERSAL_RAW | EBPF_WAF_SIG_TRAVERSAL_ENTITY);
+        EBPF_WAF_SIG_TRAVERSAL_RAW | EBPF_WAF_SIG_TRAVERSAL_ENTITY |
+        EBPF_WAF_SIG_OJS_LESS_CODE_INJECTION);
     return NGX_CONF_OK;
 }
 

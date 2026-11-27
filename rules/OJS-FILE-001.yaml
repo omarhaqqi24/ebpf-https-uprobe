@@ -6,7 +6,6 @@ description: >-
 enabled: true
 severity: high
 match:
-  operator: any
 signatures:
   - id: TEXT-X-PHP
     pattern: "text/x-php"

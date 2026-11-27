@@ -364,13 +364,19 @@ func main() {
 	if binary.Size(RequestEvent{}) != 368 || binary.Size(RawChunkEvent{}) != 4160 ||
 		objs.SignaturePatterns.ValueSize() != uint32(binary.Size(runtimeSignature{})) ||
 		objs.AutomatonTransitions.ValueSize() != uint32(binary.Size(runtimeAutomatonTransition{})) ||
-		objs.RuleConfigs.ValueSize() != uint32(binary.Size(runtimeRule{})) {
-		log.Fatalf("C/Go BPF ABI mismatch: request=%d raw=%d signature=%d/%d rule=%d/%d automaton=%d/%d",
+		objs.RuleConfigs.ValueSize() != uint32(binary.Size(runtimeRule{})) ||
+		objs.ScopeRegistry.KeySize() != uint32(binary.Size(runtimeScopeKey{})) || objs.ScopeRegistry.ValueSize() != 4 || objs.ParserPrograms.KeySize() != 4 || objs.ParserPrograms.ValueSize() != 4 {
+		log.Fatalf("C/Go BPF ABI mismatch: request=%d raw=%d signature=%d/%d rule=%d/%d automaton=%d/%d scope=%d/%d",
 			binary.Size(RequestEvent{}), binary.Size(RawChunkEvent{}), objs.SignaturePatterns.ValueSize(), binary.Size(runtimeSignature{}),
-			objs.RuleConfigs.ValueSize(), binary.Size(runtimeRule{}), objs.AutomatonTransitions.ValueSize(), binary.Size(runtimeAutomatonTransition{}))
+			objs.RuleConfigs.ValueSize(), binary.Size(runtimeRule{}), objs.AutomatonTransitions.ValueSize(), binary.Size(runtimeAutomatonTransition{}), objs.ScopeRegistry.KeySize(), binary.Size(runtimeScopeKey{}))
 	}
-	if err := applyRules(*rulesDir, objs.SignaturePatterns, objs.RuleConfigs, objs.AutomatonTransitions); err != nil {
+	if err := applyRules(*rulesDir, objs.SignaturePatterns, objs.RuleConfigs, objs.AutomatonTransitions, objs.ScopedTransitions, objs.ScopeRegistry); err != nil {
 		log.Fatalf("loading WAF rules: %v", err)
+	}
+	parserProgramKey := uint32(0)
+	parserProgramFD := uint32(objs.SslParseStep.FD())
+	if err := objs.ParserPrograms.Update(&parserProgramKey, parserProgramFD, ebpf.UpdateAny); err != nil {
+		log.Fatalf("installing parser tail-call program: %v", err)
 	}
 	mapPinned := pinnedVerdicts != nil
 	if pinnedVerdicts != nil {

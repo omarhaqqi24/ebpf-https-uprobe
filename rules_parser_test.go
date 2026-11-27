@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cilium/ebpf"
 )
 
 func TestRuleFilesCompileToRuntimeMaps(t *testing.T) {
@@ -15,19 +17,16 @@ func TestRuleFilesCompileToRuntimeMaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rules) != 2 || len(sigs) != 14 || len(configs) != 2 {
+	if len(rules) != 4 || len(sigs) != 17 || len(configs) != 4 {
 		t.Fatalf("unexpected compiled config: rules=%d signatures=%d", len(rules), len(sigs))
 	}
 	for i, sig := range sigs {
-		if sig.PatternLen == 0 || sig.PatternLen > maxPatternBytes {
+		if sig.PatternLen > maxPatternBytes {
 			t.Fatalf("signature %d has invalid pattern length %d", i, sig.PatternLen)
 		}
-		if sig.VerdictMask == 0 {
-			t.Fatalf("configured OJS signature %d has no compatible verdict category", i)
+		if sig.PatternLen != 0 && sig.VerdictMask == 0 {
+			t.Fatalf("configured literal signature %d has no verdict category", i)
 		}
-	}
-	if configs[0].Operator != runtimeRuleAny || configs[1].Operator != runtimeRuleAny {
-		t.Fatalf("unexpected rule operators: %+v", configs)
 	}
 }
 
@@ -57,12 +56,12 @@ func TestCompiledAutomatonMatchesExactAndFoldedPatterns(t *testing.T) {
 		t.Fatal(err)
 	}
 	signatures, matchedRules, flags := match(transitions, []byte("POST /upload text/x-php"))
-	if signatures&1 == 0 || matchedRules&1 == 0 || flags&1 == 0 {
+	if signatures&(1<<3) == 0 || matchedRules&(1<<2) == 0 || flags&1 == 0 {
 		t.Fatalf("exact signature output missing: signatures=%032b rules=%032b flags=%032b", signatures, matchedRules, flags)
 	}
 
 	dir := t.TempDir()
-	content := "id: CASE-1\nname: Case check\nvulnerability: test_rule\nenabled: true\nmatch:\n  operator: any\nsignatures:\n  - id: FOLDED\n    pattern: 'AbC'\n    case_sensitive: false\n"
+	content := "id: CASE-1\nname: Case check\nvulnerability: test_rule\nenabled: true\nsignatures:\n  - id: FOLDED\n    pattern: 'AbC'\n    case_sensitive: false\n"
 	if err := os.WriteFile(filepath.Join(dir, "case.yaml"), []byte(content), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -80,39 +79,18 @@ func TestCompiledAutomatonMatchesExactAndFoldedPatterns(t *testing.T) {
 	}
 }
 
-func TestRuleLoaderRejectsInvalidLimits(t *testing.T) {
-	for _, tc := range []struct {
-		name, operator, pattern string
-		signatures              int
-	}{
-		{name: "operator", operator: "xor", pattern: "x", signatures: 1},
-		{name: "pattern length", operator: "any", pattern: strings.Repeat("x", maxPatternBytes+1), signatures: 1},
+func TestRuleLoaderRejectsRemovedOperatorAndInvalidPattern(t *testing.T) {
+	for _, content := range []string{
+		"id: TEST\nname: Test\nvulnerability: test_rule\nenabled: true\nmatch:\n  operator: any\nsignatures:\n  - id: X\n    pattern: x\n",
+		fmt.Sprintf("id: TEST\nname: Test\nvulnerability: test_rule\nenabled: true\nsignatures:\n  - id: X\n    pattern: %q\n", strings.Repeat("x", maxPatternBytes+1)),
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			var sigs strings.Builder
-			for i := 0; i < tc.signatures; i++ {
-				fmt.Fprintf(&sigs, "  - id: S%d\n    pattern: %q\n", i, tc.pattern)
-			}
-			body := fmt.Sprintf("id: TEST\nname: Test\nvulnerability: test_rule\nenabled: true\nmatch:\n  operator: %s\nsignatures:\n%s", tc.operator, sigs.String())
-			if err := os.WriteFile(filepath.Join(dir, "test.yaml"), []byte(body), 0600); err != nil {
-				t.Fatal(err)
-			}
-			if _, _, _, err := loadRules(dir); err == nil {
-				t.Fatal("invalid rule configuration was accepted")
-			}
-		})
-	}
-}
-
-func TestRuleLoaderRejectsAllOperatorForKernelAutomaton(t *testing.T) {
-	dir := t.TempDir()
-	content := "id: COMBO-1\nname: Combo\nvulnerability: test_rule\nenabled: true\nmatch:\n  operator: all\nsignatures:\n  - id: FIRST\n    pattern: \"ABC\"\n    case_sensitive: false\n  - id: SECOND\n    pattern: \"xyz\"\n"
-	if err := os.WriteFile(filepath.Join(dir, "combo.yaml"), []byte(content), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, _, err := loadRules(dir); err == nil || !strings.Contains(err.Error(), "all is not supported") {
-		t.Fatalf("unsupported all operator should be rejected explicitly, got %v", err)
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "test.yaml"), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := loadRules(dir); err == nil {
+			t.Fatalf("invalid rule accepted: %s", content)
+		}
 	}
 }
 
@@ -188,5 +166,260 @@ func TestEventAndMapABI(t *testing.T) {
 	}
 	if got := binary.Size(RequestCounters{}); got != 120 {
 		t.Fatalf("request counter map value size=%d, want 120", got)
+	}
+}
+
+func TestScopedMatcherRepeatAndHeaderScope(t *testing.T) {
+	rules, _, _, err := loadRules("rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trans, err := buildScopedTransitions(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scopeIDs, err := scopeIDMap(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(scope scopeKey, v []byte) (uint32, uint32) {
+		var st uint32
+		var sigs, rm uint32
+		for _, b := range v {
+			tr := trans[(scopeIDs[scope]*maxScopedStates+st)*256+uint32(b)]
+			st = tr.NextState
+			sigs |= tr.Matches
+			rm |= tr.Rules
+		}
+		return sigs, rm
+	}
+	positives := []string{"'; @import(inline) '/x'", "'; @import 	 (  inline	 ) '/x'", "';" + strings.Repeat(" ", 1024) + "@import" + strings.Repeat("\t", 64) + "(" + strings.Repeat(" ", 8) + "inline" + strings.Repeat("\t", 256) + ")"}
+	for _, v := range positives {
+		s, r := run(scopeKey{"http_header_value", "x-forwarded-host"}, []byte(v))
+		if s&1 == 0 || r&1 == 0 {
+			t.Errorf("inline import missed: %x/%x", s, r)
+		}
+	}
+	data := "'; body { background: data-uri('/etc/passwd'); } //"
+	s, r := run(scopeKey{"http_header_value", "x-forwarded-host"}, []byte(data))
+	if s&2 == 0 || r&1 == 0 {
+		t.Fatalf("data-uri missed: %x/%x", s, r)
+	}
+	negatives := []string{"journals.example.org", "@import (inline)", "'; @import url('/x')", "'; body { background: url(x); }"}
+	for _, v := range negatives {
+		s, r := run(scopeKey{"http_header_value", "x-forwarded-host"}, []byte(v))
+		if s != 0 || r != 0 {
+			t.Errorf("unexpected match: %q %x/%x", v, s, r)
+		}
+	}
+	body := []byte("1;++++++@import+++++++++(inline)+++'")
+	bs, br := run(scopeKey{"http_body_parameter", "baseColour"}, body)
+	if bs&(1<<2) == 0 || br&(1<<1) == 0 {
+		t.Fatalf("raw baseColour token sequence missed: %x/%x", bs, br)
+	}
+	for _, bad := range [][]byte{[]byte("1;@import+++(inline)+++'"), []byte("1;++++++@import+++++++++(inline)++%2B+'"), []byte("1;++++++@import+++++++++(inline)++%2B+'")} {
+		s, r := run(scopeKey{"http_body_parameter", "baseColour"}, bad)
+		if s&(1<<2) != 0 || r&(1<<1) != 0 {
+			t.Errorf("unexpected body match %q: %x/%x", bad, s, r)
+		}
+	}
+}
+
+func TestRepeatTokenSemanticsAndDynamicScopeIsolation(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"one.yaml": `id: R1
+name: Repeat one
+vulnerability: test_rule
+enabled: true
+match:
+  scope:
+    type: http_body_parameter
+    name: themeName
+signatures:
+  - id: S1
+    matcher:
+      tokens:
+        - literal: A
+        - repeat:
+            chars: ["x"]
+            min: 2
+            max: 4
+        - literal: B
+`,
+		"two.yaml": `id: R2
+name: Repeat exact
+vulnerability: test_rule
+enabled: true
+match:
+  scope:
+    type: http_header_value
+    name: X-Custom
+signatures:
+  - id: S2
+    matcher:
+      tokens:
+        - literal: A
+        - repeat:
+            chars: ["."]
+            min: 2
+            max: 2
+        - literal: B
+`,
+	}
+	for n, c := range files {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(c), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rules, _, _, err := loadRules(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rules[1].Match.Scope.Name != "x-custom" {
+		t.Fatalf("header scope was not canonicalized: %+v", rules[1].Match.Scope)
+	}
+	trans, err := buildScopedTransitions(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := scopeIDMap(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(scope scopeKey, input string) uint32 {
+		st := uint32(0)
+		var matches uint32
+		for _, b := range []byte(input) {
+			tr := trans[(ids[scope]*maxScopedStates+st)*256+uint32(b)]
+			st = tr.NextState
+			matches |= tr.Matches
+		}
+		return matches
+	}
+	body := scopeKey{"http_body_parameter", "themeName"}
+	header := scopeKey{"http_header_value", "x-custom"}
+	if run(body, "AxxB")&1 == 0 || run(body, "AxxxxB")&1 == 0 {
+		t.Fatal("bounded repeat failed within [min,max]")
+	}
+	if run(body, "AxB")&1 != 0 || run(body, "AxxxxxB")&1 != 0 {
+		t.Fatal("bounded repeat accepted outside [min,max]")
+	}
+	if run(header, "A..B")&2 == 0 || run(header, "A.B")&2 != 0 || run(header, "AxxB")&2 != 0 {
+		t.Fatal("exact repeat or scope isolation failed")
+	}
+	if run(body, "A..B")&2 != 0 || run(header, "AxxB")&1 != 0 {
+		t.Fatal("matcher output leaked across scope IDs")
+	}
+}
+
+func TestRepeatZeroMinimumUnboundedAndRuleSchemaValidation(t *testing.T) {
+	dir := t.TempDir()
+	content := `id: UNBOUND
+name: Repeat unbounded
+vulnerability: test_rule
+enabled: true
+match:
+  scope:
+    type: http_body_parameter
+    name: q
+signatures:
+  - id: S
+    matcher:
+      tokens:
+        - literal: A
+        - repeat:
+            chars: [".", "+", " ", "\t"]
+            min: 0
+        - literal: B
+`
+	if err := os.WriteFile(filepath.Join(dir, "r.yaml"), []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rules, _, _, err := loadRules(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trans, err := buildScopedTransitions(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, _ := scopeIDMap(rules)
+	run := func(v string) bool {
+		st := uint32(0)
+		var matched uint32
+		for _, b := range []byte(v) {
+			tr := trans[(ids[scopeKey{"http_body_parameter", "q"}]*maxScopedStates+st)*256+uint32(b)]
+			st = tr.NextState
+			matched |= tr.Matches
+		}
+		return matched&1 != 0
+	}
+	for _, v := range []string{"AB", "A...B", "A++ B", "A.\tB"} {
+		if !run(v) {
+			t.Errorf("unbounded/zero-min repeat missed %q", v)
+		}
+	}
+	invalid := []string{
+		strings.Replace(content, "    name: q\n", "    name: q\n  operator: any\n", 1),
+		strings.Replace(content, "      tokens:\n", "      type: token_sequence\n      tokens:\n", 1),
+		strings.Replace(content, "      tokens:\n", "      case_sensitive: true\n      tokens:\n", 1),
+		strings.Replace(content, "        - repeat:\n", "        - hws:\n            quantifier: zero_or_more\n", 1),
+	}
+	for _, bad := range invalid {
+		testDir := t.TempDir()
+		if e := os.WriteFile(filepath.Join(testDir, "bad.yaml"), []byte(bad), 0600); e != nil {
+			t.Fatal(e)
+		}
+		if _, _, _, e := loadRules(testDir); e == nil {
+			t.Errorf("removed/unknown schema field was accepted")
+		}
+	}
+}
+
+func TestBodyScopeNamesAreExactAndDynamic(t *testing.T) {
+	dir := t.TempDir()
+	for i, name := range []string{"baseColour", "BaseColour"} {
+		c := fmt.Sprintf("id: R%d\nname: Scope %d\nvulnerability: test_rule\nenabled: true\nmatch:\n  scope:\n    type: http_body_parameter\n    name: %s\nsignatures:\n  - id: S%d\n    matcher:\n      tokens:\n        - literal: X\n", i, i, name, i)
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("%d.yaml", i)), []byte(c), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rules, _, _, err := loadRules(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := scopeIDMap(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[scopeKey{"http_body_parameter", "baseColour"}] == ids[scopeKey{"http_body_parameter", "BaseColour"}] {
+		t.Fatalf("body scope names are not distinct/exact: %#v", ids)
+	}
+}
+
+func TestKernelBPFStartupMaps(t *testing.T) {
+	if os.Getenv("EBPF_WAF_KERNEL_TEST") != "1" {
+		t.Skip("set EBPF_WAF_KERNEL_TEST=1 to load BPF programs without attaching probes")
+	}
+	spec, err := loadBpf()
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs := bpfObjects{}
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
+		t.Fatalf("load BPF collection: %v", err)
+	}
+	defer objs.Close()
+	if objs.ScopeRegistry.KeySize() != uint32(binary.Size(runtimeScopeKey{})) || objs.ScopeRegistry.ValueSize() != 4 {
+		t.Fatalf("scope registry ABI mismatch: %d/%d", objs.ScopeRegistry.KeySize(), objs.ScopeRegistry.ValueSize())
+	}
+	if err := applyRules("rules", objs.SignaturePatterns, objs.RuleConfigs, objs.AutomatonTransitions, objs.ScopedTransitions, objs.ScopeRegistry); err != nil {
+		t.Fatalf("load rule and scope maps: %v", err)
+	}
+	key := uint32(0)
+	fd := uint32(objs.SslParseStep.FD())
+	if err := objs.ParserPrograms.Update(&key, fd, ebpf.UpdateAny); err != nil {
+		t.Fatalf("install parser tail-call program: %v", err)
 	}
 }

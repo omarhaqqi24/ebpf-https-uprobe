@@ -5,7 +5,6 @@ description: Detects raw and entity-encoded parent path patterns.
 enabled: true
 severity: high
 match:
-  operator: any
 signatures:
   - id: TRAVERSAL-RAW
     pattern: "../"

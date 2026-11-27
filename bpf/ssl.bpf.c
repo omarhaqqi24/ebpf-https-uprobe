@@ -5,13 +5,16 @@
 
 #define MAX_DATA_SIZE 4096
 #define MAX_SCAN_SIZE MAX_DATA_SIZE
-#define MAX_INSPECT_SIZE (4 * MAX_DATA_SIZE)
+#define MAX_INSPECT_SIZE (15 * 1024)
+#define MAX_PARSE_BATCH 512
 #define CONN_STATE_TTL_NS (300ULL * 1000000000ULL)
 #define MAX_REQUEST_SIZE 8192
 #define MAX_METHOD_LEN 16
 #define MAX_URI_LEN 256
 #define MAX_VERSION_LEN 16
-#define MAX_HEADER_NAME 24
+#define MAX_HEADER_NAME 64
+#define MAX_SCOPE_NAME 64
+#define MAX_SCOPES 16
 #define MAX_SIG_LEN 24
 #define VERDICT_TTL_NS (300ULL * 1000000000ULL)
 
@@ -27,6 +30,7 @@ enum parser_mode {
     PARSER_HEADERS = 1,
     PARSER_BODY = 2,
     PARSER_DISABLED = 3,
+    PARSER_FORM_BODY = 4,
 };
 
 enum correlation_status {
@@ -55,8 +59,6 @@ enum verdict_status {
 #define MAX_SIGNATURES 32
 #define MAX_AUTOMATON_STATES 512
 #define MAX_RULES 32
-#define RULE_OPERATOR_ANY 0
-#define RULE_OPERATOR_ALL 1
 
 struct signature_pattern {
     __u32 rule_index;
@@ -76,14 +78,34 @@ struct automaton_transition {
 struct rule_config {
     __u32 signature_mask;
     __u8 enabled;
-    __u8 operator;
-    __u16 pad;
+    __u8 pad[3];
 };
 
 struct ssl_args {
     __u64 ssl;
     __u64 buf;
     __u64 len;
+};
+struct conn_key {
+    __u32 pid;
+    __u32 pad;
+    __u64 ssl;
+};
+struct ssl_read_context {
+    struct conn_key key;
+    __u32 tgid;
+    __s32 ret_len;
+    __u32 requested_len;
+    __u32 safe_len;
+    __u32 capture_flags;
+    __u32 chunk_index;
+    __u32 expected_chunks;
+    __u32 byte_offset;
+    __u32 current_chunk_len;
+    __u32 pad;
+    __u64 timestamp_ns;
+    __u64 ssl;
+    __u64 read_sequence;
 };
 
 /* Metadata-only event: payload bytes stay in kernel space. */
@@ -174,12 +196,14 @@ struct scan_buffer {
     char data[MAX_SCAN_SIZE];
 };
 
-struct conn_key {
-    __u32 pid;
-    __u32 pad;
-    __u64 ssl;
-};
 
+struct scope_key {
+    __u32 prefix_len;
+    __u8 kind;
+    __u8 name_len;
+    __u16 pad;
+    char name[MAX_SCOPE_NAME];
+};
 struct conn_state {
     __u64 last_seen_ns;
     __u64 read_sequence;
@@ -197,6 +221,12 @@ struct conn_state {
     __u8 request_token;
     __u8 header_in_value;
     __u8 header_kind;
+    __u8 content_type_index;
+    __u8 content_type_valid;
+    __u8 content_type_seen;
+    __u8 body_form;
+    __u8 body_in_value;
+    __u8 scope_active;
     __u8 content_length_digits;
     __u8 content_length_trailing_space;
     __u8 request_started;
@@ -213,11 +243,13 @@ struct conn_state {
     __u32 matched_signatures;
     __u32 matched_rules;
     __u32 rule_seen[MAX_RULES];
-    __u32 request_scan_window_len;
+    __u32 scoped_matcher_state;
+    __u32 active_scope_id;
     __u32 exact_matcher_state;
     __u32 folded_matcher_state;
     char request_scan_window[MAX_SIG_LEN];
-    char header_name[MAX_HEADER_NAME];
+    struct scope_key header_scope_key;
+    struct scope_key body_scope_key;
     char method[MAX_METHOD_LEN];
     char uri[MAX_URI_LEN];
     char http_version[MAX_VERSION_LEN];
@@ -229,6 +261,24 @@ struct {
     __type(key, __u64);
     __type(value, struct ssl_args);
 } active_args SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct ssl_read_context);
+} ssl_read_contexts SEC(".maps");
+static __always_inline struct ssl_read_context *get_ssl_read_context(void)
+{
+    __u32 zero=0;
+    return bpf_map_lookup_elem(&ssl_read_contexts,&zero);
+}
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} parser_programs SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -274,6 +324,21 @@ struct {
     __type(key, __u32);
     __type(value, struct automaton_transition);
 } automaton_transitions SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_SCOPES * MAX_AUTOMATON_STATES * 256);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, __u32);
+    __type(value, struct automaton_transition);
+} scoped_transitions SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, MAX_SCOPES);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct scope_key);
+    __type(value, __u32);
+} scope_registry SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -344,17 +409,48 @@ static __always_inline int line_equals(const char *line, __u32 len,
 struct parser_ctx {
     struct conn_state *state;
     struct scan_buffer *scratch;
-    __u32 tgid;
-    __u32 read_len;
-    __u32 read_signature_flags;
-    __u32 read_matched_rules;
-    __u32 requested_len;
-    __s32 ret_len;
-    __u32 read_offset;
-    __u8 degraded_match_done;
-    __u64 ssl;
-    __u64 timestamp_ns;
+    __u32 callback_offset;
 };
+
+static __always_inline int update_request_verdict(struct parser_ctx *ctx, __u32 status, __u32 correlation, __u32 inspection, __u32 tracking);
+static __always_inline void emit_detection(struct parser_ctx *ctx, __u32 sig, __u32 rule_mask, __u32 malicious, __u32 correlated);
+
+static __noinline void inspect_scoped_byte(struct parser_ctx *ctx, __u32 scope_id, char c)
+{
+    if (!scope_id) return;
+    struct conn_state *state=ctx->state;
+    __u32 key=(scope_id*MAX_AUTOMATON_STATES+state->scoped_matcher_state)*256+(__u8)c;
+    struct automaton_transition *tr=bpf_map_lookup_elem(&scoped_transitions,&key);
+    __u32 next=0,matches=0,rules=0,flags=0;
+    if(tr){next=tr->next_state;matches=tr->matched_signatures;rules=tr->matched_rules;flags=tr->verdict_flags;}
+    state->scoped_matcher_state=next;
+    if(!matches)return;
+    state->matched_signatures|=matches;
+    state->matched_rules|=rules;
+    if(!state->first_signature) state->first_signature=flags;
+    state->is_malicious=state->matched_rules!=0;
+    update_request_verdict(ctx, VERDICT_MALICIOUS,
+        state->correlation_known ? CORRELATION_RELIABLE : CORRELATION_UNKNOWN,
+        INSPECTION_INCOMPLETE, TRACKING_INCOMPLETE);
+    emit_detection(ctx,matches,state->matched_rules,state->is_malicious,state->correlation_known);
+}
+static __always_inline __u32 lookup_scope(const struct scope_key *key);
+static __always_inline void parser_error(struct parser_ctx *ctx, __u16 flags);
+static __always_inline void inspect_form_body_byte(struct parser_ctx *ctx, char c)
+{
+    struct conn_state *state=ctx->state;
+    if (!state->body_in_value) {
+        if (c == '&') { state->body_scope_key.name_len=0; state->body_scope_key.prefix_len=32; state->body_scope_key.kind=2; state->body_scope_key.pad=0; }
+        else if (c == '=') { state->body_in_value=1; state->active_scope_id=state->body_scope_key.name_len ? lookup_scope(&state->body_scope_key) : 0; state->scoped_matcher_state=0; }
+        else { __u32 n=state->body_scope_key.name_len; if (n>=MAX_SCOPE_NAME) { parser_error(ctx,REQUEST_FLAG_UNSUPPORTED); return; } if(n==0){state->body_scope_key.kind=2; state->body_scope_key.pad=0;} state->body_scope_key.name[n]=c; state->body_scope_key.name_len=n+1; state->body_scope_key.prefix_len=(4+n+1)*8; }
+    } else if (c == '&') { state->body_in_value=0; state->active_scope_id=0; state->scoped_matcher_state=0; state->body_scope_key.name_len=0; state->body_scope_key.prefix_len=32; state->body_scope_key.kind=2; state->body_scope_key.pad=0; }
+    else inspect_scoped_byte(ctx,state->active_scope_id,c);
+}
+static __always_inline __u32 lookup_scope(const struct scope_key *key)
+{
+    __u32 *id=bpf_map_lookup_elem(&scope_registry,key);
+    return id ? *id : 0;
+}
 
 static __always_inline struct request_counters *get_request_counters(void);
 static __always_inline int update_request_verdict(struct parser_ctx *ctx,
@@ -374,13 +470,15 @@ static __always_inline void emit_detection(struct parser_ctx *ctx, __u32 sig,
             counters->detection_drops++;
         return;
     }
-    event->pid = ctx->tgid;
+    struct ssl_read_context *read_ctx=get_ssl_read_context();
+    if(!read_ctx){bpf_ringbuf_discard(event,0);return;}
+    event->pid = read_ctx->tgid;
     event->tid = (__u32)bpf_get_current_pid_tgid();
-    event->timestamp_ns = ctx->timestamp_ns;
-    event->ssl = ctx->ssl;
-    event->requested_len = ctx->requested_len;
-    event->ret_len = ctx->ret_len;
-    event->scanned_len = ctx->read_len;
+    event->timestamp_ns = read_ctx->timestamp_ns;
+    event->ssl = read_ctx->ssl;
+    event->requested_len = read_ctx->requested_len;
+    event->ret_len = read_ctx->ret_len;
+    event->scanned_len = read_ctx->current_chunk_len;
     event->signature_flags = sig;
     event->matched_rules = rule_mask;
     event->request_sequence = (correlated || (ctx->state->parser_mode != PARSER_DISABLED && ctx->state->request_started)) ? ctx->state->active_request_sequence : 0;
@@ -388,7 +486,7 @@ static __always_inline void emit_detection(struct parser_ctx *ctx, __u32 sig,
     event->correlation_status = correlated ? CORRELATION_RELIABLE : CORRELATION_UNKNOWN;
     event->is_malicious = malicious;
     event->flags = ctx->state->request_flags;
-    event->read_offset = ctx->read_offset;
+    event->read_offset = read_ctx->chunk_index*MAX_DATA_SIZE+read_ctx->byte_offset;
     bpf_ringbuf_submit(event, 0);
     if (!correlated) {
         struct request_counters *counters = get_request_counters();
@@ -428,7 +526,6 @@ static __always_inline void inspect_request_byte(struct parser_ctx *ctx, char c)
         return;
     __u32 triggered_rules = exact_rules | folded_rules;
     __u32 verdict_flags = exact_flags | folded_flags;
-    ctx->read_signature_flags |= matches;
     if (state->parser_mode != PARSER_DISABLED && state->request_started) {
         state->matched_signatures |= matches;
         if (!state->first_signature)
@@ -442,8 +539,6 @@ static __always_inline void inspect_request_byte(struct parser_ctx *ctx, char c)
                        state->correlation_known);
     } else {
         emit_detection(ctx, matches, triggered_rules, triggered_rules != 0, 0);
-        if (triggered_rules)
-            ctx->degraded_match_done = 1;
     }
 }
 
@@ -463,10 +558,12 @@ static __always_inline int update_request_verdict(struct parser_ctx *ctx,
         ctx->state->active_request_sequence == 0)
         return -1;
 
+    struct ssl_read_context *read_ctx=get_ssl_read_context();
+    if(!read_ctx)return -1;
     struct verdict_key key = {
-        .tgid = ctx->tgid,
+        .tgid = read_ctx->tgid,
         .pad = 0,
-        .ssl = ctx->ssl,
+        .ssl = read_ctx->ssl,
         .request_sequence = ctx->state->active_request_sequence,
     };
     __u64 now = bpf_ktime_get_ns();
@@ -517,6 +614,16 @@ static __always_inline void reset_request(struct conn_state *state)
     state->request_token = 0;
     state->header_in_value = 0;
     state->header_kind = 0;
+    state->active_scope_id = 0;
+    state->scope_active = 0;
+    state->content_type_index = 0;
+    state->content_type_valid = 0;
+    state->content_type_seen = 0;
+    state->body_form = 0;
+    state->body_in_value = 0;
+    state->header_scope_key.name_len=0; state->header_scope_key.prefix_len=32; state->header_scope_key.kind=1; state->header_scope_key.pad=0; state->body_scope_key.name_len=0; state->body_scope_key.prefix_len=32; state->body_scope_key.kind=2; state->body_scope_key.pad=0;
+    state->scoped_matcher_state = 0;
+    state->header_kind = 0;
     state->content_length_digits = 0;
     state->content_length_trailing_space = 0;
     state->method_len = 0;
@@ -533,7 +640,7 @@ static __always_inline void reset_request(struct conn_state *state)
     state->matched_signatures = 0;
     state->matched_rules = 0;
     __builtin_memset(state->rule_seen, 0, sizeof(state->rule_seen));
-    state->request_scan_window_len = 0;
+    state->scoped_matcher_state = 0;
     __builtin_memset(state->request_scan_window, 0, sizeof(state->request_scan_window));
 }
 
@@ -550,10 +657,12 @@ static __always_inline int emit_request(struct parser_ctx *ctx, __u16 flags,
         return -1;
     }
 
-    event->tgid = ctx->tgid;
+    struct ssl_read_context *read_ctx=get_ssl_read_context();
+    if(!read_ctx){bpf_ringbuf_discard(event,0);return -1;}
+    event->tgid = read_ctx->tgid;
     event->request_length = ctx->state->request_length;
-    event->ssl = ctx->ssl;
-    event->timestamp_ns = ctx->timestamp_ns;
+    event->ssl = read_ctx->ssl;
+    event->timestamp_ns = read_ctx->timestamp_ns;
     event->flags = flags;
     event->request_sequence = ctx->state->correlation_known ?
         ctx->state->active_request_sequence : 0;
@@ -673,7 +782,7 @@ static __always_inline int finish_line(struct parser_ctx *ctx)
                 if (state->request_length > MAX_REQUEST_SIZE ||
                     state->body_remaining > MAX_REQUEST_SIZE - state->request_length)
                     state->request_flags |= REQUEST_FLAG_OVERSIZE;
-                state->parser_mode = PARSER_BODY;
+                state->parser_mode = state->body_form ? PARSER_FORM_BODY : PARSER_BODY;
             } else {
                 complete_request(ctx);
             }
@@ -682,8 +791,17 @@ static __always_inline int finish_line(struct parser_ctx *ctx)
                 return -1;
             if (state->header_kind == 1 && state->content_length_digits == 0)
                 return -1;
+            if (state->header_kind == 2) {
+                if (state->content_type_seen) { parser_error(ctx, REQUEST_FLAG_MALFORMED); return 0; }
+                state->body_form = state->content_type_valid && state->content_type_index >= 33;
+                state->content_type_seen = 1;
+            }
             state->header_name_len = 0;
+            state->header_scope_key.name_len = 0;
             state->header_in_value = 0;
+            state->active_scope_id = 0;
+            state->scope_active = 0;
+            state->scoped_matcher_state = 0;
             state->header_kind = 0;
             state->content_length_digits = 0;
             state->content_length_trailing_space = 0;
@@ -693,162 +811,64 @@ static __always_inline int finish_line(struct parser_ctx *ctx)
     return 0;
 }
 
+static __always_inline long parse_one_byte_inner(__u32 i, void *opaque);
 static long parse_one_byte(__u32 i, void *opaque)
 {
-    struct parser_ctx *ctx = opaque;
-    struct conn_state *state = ctx->state;
-    if (i >= ctx->read_len)
-        return 0;
-    i &= (MAX_DATA_SIZE - 1);
-    char c = ctx->scratch->data[i];
+    struct parser_ctx *ctx=opaque;
+    return parse_one_byte_inner(i+ctx->callback_offset, opaque);
+}
 
-    if (state->parser_mode == PARSER_REQUEST_LINE && !state->request_started &&
-        ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) {
-        state->request_sequence++;
-        state->active_request_sequence = state->request_sequence;
-        state->request_started = 1;
-        state->correlation_known = 0;
-        update_request_verdict(ctx, VERDICT_PENDING, CORRELATION_UNKNOWN,
-                               INSPECTION_INCOMPLETE, TRACKING_INCOMPLETE);
-    }
-    inspect_request_byte(ctx, c);
+static __always_inline void parse_request_line_byte(struct parser_ctx *ctx, char c)
+{
+    struct conn_state *state=ctx->state;
+    if(c==' '){if(state->request_token==0&&state->method_len>0)state->request_token=1;else if(state->request_token==1&&state->uri_len>0)state->request_token=2;else parser_error(ctx,REQUEST_FLAG_MALFORMED);return;}
+    if(state->request_token==0){__u32 pos=state->method_len;if(pos>=MAX_METHOD_LEN)state->request_flags|=REQUEST_FLAG_METADATA_TRUNCATED;else{state->method[pos]=c;state->method_len=pos+1;}}
+    else if(state->request_token==1){__u32 pos=state->uri_len;if(pos>=MAX_URI_LEN)state->request_flags|=REQUEST_FLAG_METADATA_TRUNCATED;else{state->uri[pos]=c;state->uri_len=pos+1;}}
+    else if(state->request_token==2){__u32 pos=state->version_len;if(pos>=MAX_VERSION_LEN){parser_error(ctx,REQUEST_FLAG_MALFORMED);return;}state->http_version[pos]=c;state->version_len=pos+1;}
+    else parser_error(ctx,REQUEST_FLAG_MALFORMED);
+}
 
-    if (state->parser_mode == PARSER_DISABLED)
-        return 0;
-
-    if (state->request_length < 0xffffffffU)
-        state->request_length++;
-    if (state->request_length > MAX_REQUEST_SIZE)
-        state->request_flags |= REQUEST_FLAG_OVERSIZE;
-
-    if (state->parser_mode == PARSER_BODY) {
-        if (state->body_remaining > 0)
-            state->body_remaining--;
-        if (state->body_remaining == 0)
-            complete_request(ctx);
-        return 0;
-    }
-
-    if (state->saw_cr) {
-        state->saw_cr = 0;
-        if (c != '\n') {
-            parser_error(ctx, REQUEST_FLAG_MALFORMED);
-            return 0;
+static __always_inline void parse_header_byte(struct parser_ctx *ctx, char c)
+{
+    struct conn_state *state=ctx->state;
+    if(!state->header_in_value){
+        if(c==':'){
+            if(state->header_name_len==0){parser_error(ctx,REQUEST_FLAG_MALFORMED);return;}
+            state->header_in_value=1;state->scoped_matcher_state=0;state->active_scope_id=lookup_scope(&state->header_scope_key);state->scope_active=state->active_scope_id!=0;
+            if(line_equals(state->header_scope_key.name,state->header_name_len,"content-type",12)){state->header_kind=2;state->content_type_index=0;state->content_type_valid=1;}
+            if(line_equals(state->header_scope_key.name,state->header_name_len,"transfer-encoding",17)){parser_error(ctx,REQUEST_FLAG_UNSUPPORTED);return;}
+            if(line_equals(state->header_scope_key.name,state->header_name_len,"content-length",14)){if(state->has_content_length){parser_error(ctx,REQUEST_FLAG_MALFORMED);return;}state->has_content_length=1;state->header_kind=1;}
+            return;
         }
-        int rc = finish_line(ctx);
-        if (rc == -2)
-            parser_error(ctx, REQUEST_FLAG_UNSUPPORTED);
-        else if (rc == -3)
-            parser_error(ctx, REQUEST_FLAG_OVERSIZE);
-        else if (rc != 0)
-            parser_error(ctx, REQUEST_FLAG_MALFORMED);
-        return 0;
+        __u32 pos=state->header_name_len;
+        if(pos>=MAX_HEADER_NAME){parser_error(ctx,REQUEST_FLAG_UNSUPPORTED);return;}
+        if(pos==0){state->header_scope_key.kind=1;state->header_scope_key.pad=0;}
+        state->header_scope_key.name[pos]=lower_ascii(c);state->header_name_len=pos+1;state->header_scope_key.name_len=pos+1;state->header_scope_key.prefix_len=(4+pos+1)*8;return;
     }
+    if(state->scope_active)inspect_scoped_byte(ctx,state->active_scope_id,c);
+    if(state->header_kind==2){static const char media[]="application/x-www-form-urlencoded";__u32 pos=state->content_type_index;if(pos==0&&(c==' '||c=='\t')){}else if(pos<33){if(lower_ascii(c)==media[pos])state->content_type_index=pos+1;else state->content_type_valid=0;}else if(pos==33){if(c==';')state->content_type_index=35;else if(c==' '||c=='\t')state->content_type_index=34;else state->content_type_valid=0;}else if(pos==34){if(c==';')state->content_type_index=35;else if(c!=' '&&c!='\t')state->content_type_valid=0;}}
+    if(state->header_kind==1){if(c==' '||c=='\t'){if(state->content_length_digits>0)state->content_length_trailing_space=1;return;}if(c<'0'||c>'9'||state->content_length_trailing_space){parser_error(ctx,REQUEST_FLAG_MALFORMED);return;}__u32 digit=c-'0';if(state->body_remaining>(0xffffffffU-digit)/10){parser_error(ctx,REQUEST_FLAG_OVERSIZE);return;}state->body_remaining=state->body_remaining*10+digit;if(state->body_remaining>MAX_REQUEST_SIZE)state->request_flags|=REQUEST_FLAG_OVERSIZE;state->content_length_digits++;}
+}
 
-    if (c == '\r') {
-        state->saw_cr = 1;
-        return 0;
-    }
-    if (c == '\n') {
-        parser_error(ctx, REQUEST_FLAG_MALFORMED);
-        return 0;
-    }
+static __always_inline void parse_http_line_byte(struct parser_ctx *ctx, char c)
+{
+    struct conn_state *state=ctx->state;
+    if(state->saw_cr){state->saw_cr=0;if(c!='\n'){parser_error(ctx,REQUEST_FLAG_MALFORMED);return;}int rc=finish_line(ctx);if(rc==-2)parser_error(ctx,REQUEST_FLAG_UNSUPPORTED);else if(rc==-3)parser_error(ctx,REQUEST_FLAG_OVERSIZE);else if(rc!=0)parser_error(ctx,REQUEST_FLAG_MALFORMED);return;}
+    if(c=='\r'){state->saw_cr=1;return;}if(c=='\n'){parser_error(ctx,REQUEST_FLAG_MALFORMED);return;}
+    if(state->line_len<0xffffffffU)state->line_len++;
+    if(state->parser_mode==PARSER_REQUEST_LINE)parse_request_line_byte(ctx,c);else parse_header_byte(ctx,c);
+}
 
-    if (state->line_len < 0xffffffffU)
-        state->line_len++;
-    if (state->parser_mode == PARSER_REQUEST_LINE) {
-        if (c == ' ') {
-            if (state->request_token == 0 && state->method_len > 0)
-                state->request_token = 1;
-            else if (state->request_token == 1 && state->uri_len > 0)
-                state->request_token = 2;
-            else
-                parser_error(ctx, REQUEST_FLAG_MALFORMED);
-            return 0;
-        }
-
-        if (state->request_token == 0) {
-            __u32 pos = state->method_len;
-            if (pos >= MAX_METHOD_LEN) {
-                state->request_flags |= REQUEST_FLAG_METADATA_TRUNCATED;
-            } else {
-                state->method[pos] = c;
-                state->method_len = pos + 1;
-            }
-        } else if (state->request_token == 1) {
-            __u32 pos = state->uri_len;
-            if (pos >= MAX_URI_LEN) {
-                state->request_flags |= REQUEST_FLAG_METADATA_TRUNCATED;
-            } else {
-                state->uri[pos] = c;
-                state->uri_len = pos + 1;
-            }
-        } else if (state->request_token == 2) {
-            __u32 pos = state->version_len;
-            if (pos >= MAX_VERSION_LEN) {
-                parser_error(ctx, REQUEST_FLAG_MALFORMED);
-                return 0;
-            }
-            state->http_version[pos] = c;
-            state->version_len = pos + 1;
-        } else {
-            parser_error(ctx, REQUEST_FLAG_MALFORMED);
-        }
-        return 0;
-    }
-
-    if (!state->header_in_value) {
-        if (c == ':') {
-            if (state->header_name_len == 0) {
-                parser_error(ctx, REQUEST_FLAG_MALFORMED);
-                return 0;
-            }
-            state->header_in_value = 1;
-            if (line_equals(state->header_name, state->header_name_len,
-                            "transfer-encoding", 17)) {
-                parser_error(ctx, REQUEST_FLAG_UNSUPPORTED);
-                return 0;
-            }
-            if (line_equals(state->header_name, state->header_name_len,
-                            "content-length", 14)) {
-                if (state->has_content_length) {
-                    parser_error(ctx, REQUEST_FLAG_MALFORMED);
-                    return 0;
-                }
-                state->has_content_length = 1;
-                state->header_kind = 1;
-            }
-            return 0;
-        }
-
-        __u32 pos = state->header_name_len;
-        if (pos < MAX_HEADER_NAME)
-            state->header_name[pos] = lower_ascii(c);
-        state->header_name_len = pos + 1;
-        return 0;
-    }
-
-    if (state->header_kind == 1) {
-        if (c == ' ' || c == '\t') {
-            if (state->content_length_digits > 0)
-                state->content_length_trailing_space = 1;
-            return 0;
-        }
-        if (c < '0' || c > '9' || state->content_length_trailing_space) {
-            parser_error(ctx, REQUEST_FLAG_MALFORMED);
-            return 0;
-        }
-        __u32 digit = c - '0';
-        if (state->body_remaining > (0xffffffffU - digit) / 10) {
-            parser_error(ctx, REQUEST_FLAG_OVERSIZE);
-            return 0;
-        }
-        state->body_remaining = state->body_remaining * 10 + digit;
-        if (state->body_remaining > MAX_REQUEST_SIZE)
-            state->request_flags |= REQUEST_FLAG_OVERSIZE;
-        state->content_length_digits++;
-    }
-    return 0;
+static __always_inline long parse_one_byte_inner(__u32 i, void *opaque)
+{
+    struct parser_ctx *ctx=opaque;struct conn_state *state=ctx->state;
+    i&=(MAX_DATA_SIZE-1);char c=ctx->scratch->data[i];
+    if(state->parser_mode==PARSER_REQUEST_LINE&&!state->request_started&&((c>='A'&&c<='Z')||(c>='a'&&c<='z'))){state->request_sequence++;state->active_request_sequence=state->request_sequence;state->request_started=1;state->correlation_known=0;update_request_verdict(ctx,VERDICT_PENDING,CORRELATION_UNKNOWN,INSPECTION_INCOMPLETE,TRACKING_INCOMPLETE);}
+    inspect_request_byte(ctx,c);
+    if(state->parser_mode==PARSER_DISABLED)return 0;
+    if(state->request_length<0xffffffffU)state->request_length++;if(state->request_length>MAX_REQUEST_SIZE)state->request_flags|=REQUEST_FLAG_OVERSIZE;
+    if(state->parser_mode==PARSER_BODY||state->parser_mode==PARSER_FORM_BODY){if(state->parser_mode==PARSER_FORM_BODY)inspect_form_body_byte(ctx,c);if(state->body_remaining>0)state->body_remaining--;if(state->body_remaining==0)complete_request(ctx);return 0;}
+    parse_http_line_byte(ctx,c);return 0;
 }
 
 static __always_inline void emit_raw_chunk(struct parser_ctx *parser, __u64 seq,
@@ -859,11 +879,13 @@ static __always_inline void emit_raw_chunk(struct parser_ctx *parser, __u64 seq,
     struct raw_chunk_event *event = bpf_ringbuf_reserve(&raw_events, sizeof(*event), 0);
     struct request_counters *counters = get_request_counters();
     if (!event) { if (counters) counters->raw_ringbuf_drops++; return; }
-    event->tgid = parser->tgid;
+    struct ssl_read_context *read_ctx=get_ssl_read_context();
+    if(!read_ctx){bpf_ringbuf_discard(event,0);return;}
+    event->tgid = read_ctx->tgid;
     event->tid = (__u32)bpf_get_current_pid_tgid();
-    event->ssl = parser->ssl;
+    event->ssl = read_ctx->ssl;
     event->read_sequence = seq;
-    event->timestamp_ns = parser->timestamp_ns;
+    event->timestamp_ns = read_ctx->timestamp_ns;
     event->read_total_len = returned_len;
     event->read_offset = offset;
     event->chunk_index = chunk_index;
@@ -897,119 +919,73 @@ int ssl_read_entry(struct pt_regs *ctx)
 SEC("uretprobe/SSL_read")
 int ssl_read_return(struct pt_regs *ctx)
 {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 pid = pid_tgid >> 32;
-
-    struct ssl_args *args = bpf_map_lookup_elem(&active_args, &pid_tgid);
-    if (!args)
-        return 0;
-
-    __s32 ret = (__s32)PT_REGS_RC(ctx);
-    if (ret <= 0)
-        goto cleanup;
-
-    __u32 returned_len = (__u32)ret;
-    __u32 safe_len = returned_len;
-    __u16 capture_flags = 0;
-    if ((__u64)returned_len > args->len) {
-        safe_len = args->len > 0xffffffffULL ? 0xffffffffU : (__u32)args->len;
-        capture_flags |= REQUEST_FLAG_CAPTURE_TRUNCATED;
-    }
-    if (safe_len > MAX_INSPECT_SIZE) {
-        safe_len = MAX_INSPECT_SIZE;
-        capture_flags |= REQUEST_FLAG_CAPTURE_TRUNCATED;
-    }
-    if (capture_flags & REQUEST_FLAG_CAPTURE_TRUNCATED) {
-        struct request_counters *counters = get_request_counters();
-        if (counters) counters->raw_capture_truncated++;
-    }
-
-    __u32 zero = 0;
-    struct scan_buffer *scratch = bpf_map_lookup_elem(&scan_buffers, &zero);
-    if (!scratch)
-        goto cleanup;
-
-    __u64 now = bpf_ktime_get_ns();
-    struct conn_key key = {
-        .pid = pid,
-        .pad = 0,
-        .ssl = args->ssl,
-    };
-    struct conn_state *state = bpf_map_lookup_elem(&conn_states, &key);
-    if (!state) {
-        struct conn_state *initial = bpf_map_lookup_elem(&conn_state_template, &zero);
-        if (!initial)
-            goto cleanup;
-        reset_request(initial);
-        initial->last_seen_ns = now;
-        bpf_map_update_elem(&conn_states, &key, initial, BPF_NOEXIST);
-        state = bpf_map_lookup_elem(&conn_states, &key);
-    }
-    if (!state)
-        goto cleanup;
-
+    __u64 pid_tgid=bpf_get_current_pid_tgid();
+    __u32 pid=pid_tgid>>32;
+    struct ssl_args *args=bpf_map_lookup_elem(&active_args,&pid_tgid);
+    if(!args) return 0;
+    __s32 ret=(__s32)PT_REGS_RC(ctx);
+    if(ret<=0){bpf_map_delete_elem(&active_args,&pid_tgid);return 0;}
+    __u32 returned_len=(__u32)ret;
+    __u32 safe_len=returned_len;
+    __u32 capture_flags=0;
+    if((__u64)returned_len>args->len){safe_len=args->len>0xffffffffULL?0xffffffffU:(__u32)args->len;capture_flags|=REQUEST_FLAG_CAPTURE_TRUNCATED;}
+    if(safe_len>MAX_INSPECT_SIZE){safe_len=MAX_INSPECT_SIZE;capture_flags|=REQUEST_FLAG_CAPTURE_TRUNCATED;}
+    if(capture_flags){struct request_counters *c=get_request_counters();if(c)c->raw_capture_truncated++;}
+    __u32 zero=0;
+    __u64 now=bpf_ktime_get_ns();
+    struct conn_key key={.pid=pid,.pad=0,.ssl=args->ssl};
+    struct conn_state *state=bpf_map_lookup_elem(&conn_states,&key);
+    if(!state){struct conn_state *initial=bpf_map_lookup_elem(&conn_state_template,&zero);if(!initial){bpf_map_delete_elem(&active_args,&pid_tgid);return 0;}reset_request(initial);initial->last_seen_ns=now;bpf_map_update_elem(&conn_states,&key,initial,BPF_NOEXIST);state=bpf_map_lookup_elem(&conn_states,&key);}
+    if(!state){bpf_map_delete_elem(&active_args,&pid_tgid);return 0;}
+    struct ssl_read_context *read_ctx=bpf_map_lookup_elem(&ssl_read_contexts,&zero);
+    if(!read_ctx){bpf_map_delete_elem(&active_args,&pid_tgid);return 0;}
+    read_ctx->key.pid=pid;read_ctx->key.pad=0;read_ctx->key.ssl=args->ssl;read_ctx->tgid=pid;read_ctx->ret_len=ret;read_ctx->requested_len=args->len>0xffffffffULL?0xffffffffU:(__u32)args->len;read_ctx->safe_len=safe_len;read_ctx->capture_flags=capture_flags;read_ctx->chunk_index=0;read_ctx->expected_chunks=(safe_len+MAX_DATA_SIZE-1)/MAX_DATA_SIZE;read_ctx->byte_offset=0;read_ctx->timestamp_ns=now;read_ctx->ssl=args->ssl;
+    struct parser_ctx parser={.state=state};
+    if(now-state->last_seen_ns>CONN_STATE_TTL_NS){if(state->request_started){state->correlation_known=0;state->request_flags|=REQUEST_FLAG_TRACKING_LOST;emit_request(&parser,state->request_flags,0);}reset_request(state);}
     state->read_sequence++;
-    __u64 read_sequence = state->read_sequence;
-    struct parser_ctx parser = {
-        .state = state,
-        .scratch = scratch,
-        .tgid = pid,
-        .requested_len = args->len > 0xffffffffULL ? 0xffffffffU : (__u32)args->len,
-        .ret_len = ret,
-        .ssl = args->ssl,
-        .timestamp_ns = now,
-    };
+    read_ctx->read_sequence=state->read_sequence;
+    bpf_tail_call(ctx,&parser_programs,0);
+    parser_error(&parser,REQUEST_FLAG_CAPTURE_TRUNCATED);
+    bpf_map_delete_elem(&active_args,&pid_tgid);
+    return 0;
+}
 
-    if (now - state->last_seen_ns > CONN_STATE_TTL_NS) {
-        if (state->request_started) {
-            state->correlation_known = 0;
-            state->request_flags |= REQUEST_FLAG_TRACKING_LOST;
-            emit_request(&parser, state->request_flags, 0);
-        }
-        reset_request(state);
-    }
-
-    /* Process up to 16 KiB in four verifier-friendly 4 KiB chunks. */
-    for (int chunk = 0; chunk < MAX_INSPECT_SIZE / MAX_DATA_SIZE; chunk++) {
-        __u32 offset = chunk * MAX_DATA_SIZE;
-        if (offset >= safe_len)
-            break;
-        __u32 chunk_len = safe_len - offset;
-        if (chunk_len > MAX_DATA_SIZE)
-            chunk_len = MAX_DATA_SIZE;
-        __u64 user_addr = args->buf + offset;
-        if (bpf_probe_read_user(scratch->data, chunk_len,
-                                (const void *)user_addr) != 0) {
-            capture_flags |= REQUEST_FLAG_CAPTURE_TRUNCATED;
-            struct request_counters *counters = get_request_counters();
-            if (counters) counters->raw_capture_failures++;
-            break;
-        }
-        __u32 chunk_index = offset / MAX_DATA_SIZE;
-        __u32 expected_chunks = (safe_len + MAX_DATA_SIZE - 1) / MAX_DATA_SIZE;
-        emit_raw_chunk(&parser, read_sequence, returned_len, offset, chunk_index,
-                       expected_chunks, chunk_len, capture_flags);
-        parser.read_len = chunk_len;
-        parser.read_offset = offset;
-        long parser_result = bpf_loop(chunk_len, parse_one_byte, &parser, 0);
-        if (parser_result < 0) {
-            capture_flags |= REQUEST_FLAG_CAPTURE_TRUNCATED;
-            break;
+SEC("uprobe/ssl_parse_step")
+int ssl_parse_step(struct pt_regs *ctx)
+{
+    __u64 pid_tgid=bpf_get_current_pid_tgid();
+    __u32 pid=pid_tgid>>32;
+    __u32 zero=0;
+    struct ssl_args *args=bpf_map_lookup_elem(&active_args,&pid_tgid);
+    struct ssl_read_context *read_ctx=bpf_map_lookup_elem(&ssl_read_contexts,&zero);
+    if(!args||!read_ctx){bpf_map_delete_elem(&active_args,&pid_tgid);return 0;}
+    struct conn_state *state=bpf_map_lookup_elem(&conn_states,&read_ctx->key);
+    struct scan_buffer *scratch=bpf_map_lookup_elem(&scan_buffers,&zero);
+    if(!state||!scratch){bpf_map_delete_elem(&active_args,&pid_tgid);return 0;}
+    struct parser_ctx parser={.state=state,.scratch=scratch};
+    if(read_ctx->chunk_index<read_ctx->expected_chunks){
+        __u32 offset=read_ctx->chunk_index*MAX_DATA_SIZE;
+        __u32 chunk_len=read_ctx->safe_len-offset;
+        if(chunk_len>MAX_DATA_SIZE)chunk_len=MAX_DATA_SIZE;
+        if(bpf_probe_read_user(scratch->data,chunk_len,(const void *)(args->buf+offset))!=0){read_ctx->capture_flags|=REQUEST_FLAG_CAPTURE_TRUNCATED;struct request_counters *c=get_request_counters();if(c)c->raw_capture_failures++;read_ctx->chunk_index=read_ctx->expected_chunks;}
+        else {
+            read_ctx->current_chunk_len=chunk_len;
+            if(read_ctx->byte_offset==0)emit_raw_chunk(&parser,read_ctx->read_sequence,(__u32)read_ctx->ret_len,offset,read_ctx->chunk_index,read_ctx->expected_chunks,chunk_len,read_ctx->capture_flags);
+            parser.callback_offset=read_ctx->byte_offset;
+            __u32 batch=chunk_len-read_ctx->byte_offset;if(batch>MAX_PARSE_BATCH)batch=MAX_PARSE_BATCH;
+            if(batch==0 || bpf_loop(batch,parse_one_byte,&parser,0)<0){read_ctx->capture_flags|=REQUEST_FLAG_CAPTURE_TRUNCATED;read_ctx->chunk_index=read_ctx->expected_chunks;}
+            else {
+                read_ctx->byte_offset+=batch;
+                if(read_ctx->byte_offset<chunk_len){bpf_tail_call(ctx,&parser_programs,0);read_ctx->capture_flags|=REQUEST_FLAG_CAPTURE_TRUNCATED;read_ctx->chunk_index=read_ctx->expected_chunks;}
+                read_ctx->chunk_index++;read_ctx->byte_offset=0;
+            }
         }
     }
-
-    if (state->request_started && state->is_malicious &&
-        state->parser_mode != PARSER_DISABLED) {
-        update_request_verdict(&parser, VERDICT_MALICIOUS,
-            state->correlation_known ? CORRELATION_RELIABLE : CORRELATION_UNKNOWN,
-            INSPECTION_INCOMPLETE, TRACKING_INCOMPLETE);
-    }
-    state->last_seen_ns = now;
-    if (capture_flags)
-        parser_error(&parser, capture_flags);
-
-cleanup:
-    bpf_map_delete_elem(&active_args, &pid_tgid);
+    if(read_ctx->chunk_index<read_ctx->expected_chunks){bpf_tail_call(ctx,&parser_programs,0);read_ctx->capture_flags|=REQUEST_FLAG_CAPTURE_TRUNCATED;}
+    if(state->request_started&&state->is_malicious&&state->parser_mode!=PARSER_DISABLED)update_request_verdict(&parser,VERDICT_MALICIOUS,state->correlation_known?CORRELATION_RELIABLE:CORRELATION_UNKNOWN,INSPECTION_INCOMPLETE,TRACKING_INCOMPLETE);
+    state->last_seen_ns=read_ctx->timestamp_ns;
+    if(read_ctx->capture_flags)parser_error(&parser,read_ctx->capture_flags);
+    bpf_map_delete_elem(&active_args,&pid_tgid);
     return 0;
 }
 

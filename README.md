@@ -1,10 +1,9 @@
 # eBPF HTTPS WAF pre-filter
 
 The SSL_read uretprobe reads decrypted plaintext into a per-CPU scratch buffer.
-eBPF performs signature matching, rule evaluation, and verdict updates. A
-separate raw-event ring buffer copies each available plaintext chunk to Go for
-HTTP logging; file I/O and HTTP parsing stay in user space and do not affect
-kernel verdicts.
+eBPF incrementally parses HTTP/1.1 request boundaries, performs signature
+matching, and updates verdicts. A separate raw-event ring buffer copies each
+available plaintext chunk to Go for request logging and log correlation.
 
 ## Rules
 
@@ -13,15 +12,30 @@ filename order before populating the BPF maps. Patterns are ASCII literals,
 limited to 24 bytes. Each rule may contain up to 32 signatures, with at most
 32 rules and 32 total runtime signatures. The loader compiles enabled literal
 signatures into separate case-sensitive and ASCII-folded Aho-Corasick
-transition tables. Each automaton is limited to 512 states. Only the `any`
-operator is supported; `all` rules are rejected during rule loading because
-kernel verdict evaluation must remain bounded and verifier-safe.
+transition tables. Each automaton is limited to 512 states.
+
+Structured rules select a parser scope with `match.scope.type` and
+`match.scope.name`. Supported scopes are `http_header_value` and
+`http_body_parameter`; scope names are loaded dynamically from YAML. Header
+names are matched case-insensitively. Form parameter names are exact and
+case-sensitive. Signatures in a rule have implicit OR semantics.
+
+Structured `matcher.tokens` accept `literal` and `repeat`. A repeat token lists
+its allowed ASCII bytes in `chars`, requires a non-negative `min`, and may set
+an inclusive `max` up to 64. Omitting `max` means unbounded repetition. For
+example, zero-or-more horizontal whitespace is `repeat` with
+`chars: [" ", "\t"]` and `min: 0`.
+
+Body parameter scopes inspect raw `application/x-www-form-urlencoded` values
+framed by `&` and the first `=`. The matcher does not URL-decode `+` or `%HH`;
+`+` is only matched when a rule explicitly lists it. The eBPF parser supports
+HTTP/1.1 and `Content-Length`; chunked transfer encoding and HTTP/2 remain
+unsupported.
 
 The bundled OJS-FILE-001.yaml and OJS-TRAVERSAL-001.yaml contain the existing
 PHP/upload and path-traversal literals. Disabled rules are validated but are
-not evaluated. For case-insensitive patterns, matching uses ASCII lowercasing
-only.
-
+not evaluated. For case-insensitive literal patterns, matching uses ASCII
+lowercasing only.
 ## Detection and request identity
 
 The eBPF scanner advances two automaton states per byte using precompiled map
@@ -41,7 +55,9 @@ signature category to the Nginx rejection policy.
 ## HTTP logging
 
 Go reassembles raw_events by (TGID, SSL pointer, read_sequence, chunk_index)
-and parses HTTP/1.1 requests framed by Content-Length. It preserves header
+and parses a logging copy of HTTP/1.1 requests framed by Content-Length. The
+eBPF parser independently tracks those boundaries for scope selection and
+verdicts. It preserves header
 order and duplicates and supports multiple requests per read. Kernel request
 events and parsed requests are joined only by (TGID, SSL pointer,
 request_sequence). A gap, truncation, unsupported framing, or unknown
@@ -66,7 +82,9 @@ capacity. Raw-event drops are counted separately and never block or change
 eBPF inspection/enforcement. A lost chunk makes Go correlation unknown. Each
 SSL_read is processed by eBPF in up to four 4096-byte chunks (16 KiB);
 larger results and user-memory read failures are marked capture-incomplete.
-The parser supports HTTP/1.1 with a single valid Content-Length; chunked
+The eBPF scanner examines up to 15 KiB per SSL_read in bounded steps; any
+additional returned plaintext marks the request incomplete. The parser supports
+HTTP/1.1 with a single valid Content-Length; chunked
 transfer encoding, HTTP/2, and malformed framing remain unsupported.
 Go caps an individual buffered stream/request at 16 MiB; larger bodies are
 logged as incomplete rather than buffered without limit. When the host enforces
